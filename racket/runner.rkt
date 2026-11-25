@@ -1,0 +1,96 @@
+#lang racket/base
+;; Runs generated module programs and prints one result line per program.
+;;   racket runner.rkt server        ; framed programs on stdin: "<nbytes>\n<bytes>"
+;;   racket runner.rkt file prog.rkt ; one program
+;; The program text is a single `(module m racket/base ...)` form; it is
+;; eval'd (compiled under whatever mode the process runs in: machine code
+;; by default, interpreter under PLT_CS_INTERP=1) in a fresh namespace and
+;; instantiated.  Result line (tab-separated, fields `write`n so no raw tabs
+;; or newlines):
+;;   ok      <output>
+;;   exn     <output> <exn struct type> <first line of message>
+;;   raise   <output> <written raised value>
+;;   timeout <output>
+;;   oom
+(require racket/port racket/fixnum racket/flonum racket/unsafe/ops racket/list)
+
+(define TIMEOUT (let ([s (getenv "RKT_CASE_TIMEOUT")]) (if s (string->number s) 10)))
+(define MAX-OUT 20000)
+
+(define orig-ns (current-namespace))
+(define real-out (current-output-port))
+
+(define (first-line s)
+  (let ([m (regexp-match #rx"^[^\n]*" s)]) (car m)))
+
+(define (cap s) (if (> (string-length s) MAX-OUT) (substring s 0 MAX-OUT) s))
+
+(define (fresh-ns)
+  (define ns (make-base-namespace))
+  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list)])
+    (namespace-attach-module orig-ns m ns))
+  ns)
+
+;; Returns a list of fields.
+(define (run-program src)
+  (define out (open-output-string))
+  (define cust (make-custodian))
+  (custodian-limit-memory cust (* 2048 1024 1024) cust)
+  (define result #f)
+  (define th
+    (parameterize ([current-custodian cust])
+      (thread
+       (lambda ()
+         (set! result
+               (parameterize ([current-namespace (fresh-ns)]
+                              [current-output-port out]
+                              [current-error-port out]
+                              [read-accept-reader #f]
+                              [read-accept-lang #f])
+                 (with-handlers ([exn? (lambda (e)
+                                         (list "exn" (get-output-string out)
+                                               (symbol->string (vector-ref (struct->vector e) 0))
+                                               ;; MASK: fixnum-overflow message wording differs by
+                                               ;; mode ("with arguments" vs "computing '(fx* ..)"),
+                                               ;; also in 9.3; not specified.  Kind is still compared.
+                                               (if (exn:fail:contract:non-fixnum-result? e)
+                                                   "<masked nonfx message>"
+                                                   (first-line (exn-message e)))))]
+                                 [(lambda (v) #t)
+                                  (lambda (v) (list "raise" (get-output-string out)
+                                                    (format "~s" v)))])
+                   (define form (read (open-input-string src)))
+                   (eval form)
+                   (dynamic-require ''m #f)
+                   (list "ok" (get-output-string out)))))))))
+  (define done (sync/timeout TIMEOUT th))
+  (custodian-shutdown-all cust)
+  (cond
+    [(not done) (list "timeout" (get-output-string out))]
+    [(not result) (list "oom")]
+    [else result]))
+
+(define (emit fields)
+  (define strs
+    (for/list ([f fields] [i (in-naturals)])
+      (if (zero? i) f (format "~s" (cap f)))))
+  (write-string (string-join* strs "\t") real-out)
+  (newline real-out)
+  (flush-output real-out))
+
+(define (string-join* l sep)
+  (apply string-append (add-between l sep)))
+
+(define args (current-command-line-arguments))
+(cond
+  [(and (= (vector-length args) 1) (equal? (vector-ref args 0) "server"))
+   (let loop ()
+     (define line (read-line (current-input-port) 'linefeed))
+     (unless (eof-object? line)
+       (define n (string->number line))
+       (define bs (read-bytes n (current-input-port)))
+       (emit (run-program (bytes->string/utf-8 bs #\?)))
+       (loop)))]
+  [(and (= (vector-length args) 2) (equal? (vector-ref args 0) "file"))
+   (emit (run-program (call-with-input-file (vector-ref args 1) port->string)))]
+  [else (error 'runner "usage: runner.rkt server | file <prog>")])
