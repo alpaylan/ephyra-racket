@@ -637,19 +637,60 @@
   `(module m ,lang ,@pre ,@gc-defs
      ,@(opaque-rewrite-items items (cdddr form) rng 'gc)))
 
+(module gc-worker racket/base
+  (require racket/place)
+  (provide start)
+  (define (start ch)
+    (define n 4000)
+    (define (mk k) (vector k (exact->inexact k) (list k (number->string k))
+                           (make-bytes 3 (modulo k 256)) (box (* k k k k k k))))
+    (define (ok? k c)
+      (and (vector? c) (= (vector-length c) 5) (eqv? (vector-ref c 0) k)
+           (eqv? (vector-ref c 1) (exact->inexact k))
+           (equal? (vector-ref c 2) (list k (number->string k)))
+           (equal? (vector-ref c 3) (make-bytes 3 (modulo k 256)))
+           (eqv? (unbox (vector-ref c 4)) (* k k k k k k))))
+    (define v (build-vector n mk))
+    (define t (make-hasheq))
+    (for ([c (in-vector v)]) (hash-set! t c (vector-ref c 0)))
+    (let loop ()
+      (define m (sync/timeout 0.002 ch))
+      (when (eq? m 'check)
+        (place-channel-put
+         ch
+         (for/and ([c (in-vector v)] [k (in-naturals)])
+           (and (ok? k c) (eqv? (hash-ref t c #f) k)))))
+      (for ([j 40])
+        (define k (random n))
+        (define old (vector-ref v k))
+        (define c (mk k))
+        (hash-remove! t old)
+        (vector-set! v k c)
+        (hash-set! t c k))
+      (loop))))
+
 (define gc-place #f)
 (define (start-gc-place!)
   (unless gc-place
-    ;; an idle-ish place: a second Chez thread with preserved ownership,
-    ;; so collections go through the parallel collector
+    ;; a second Chez thread with preserved ownership, so collections go
+    ;; through the parallel collector (its sweeper owns the place's
+    ;; objects).  The place keeps a heap of its own (4000 cells, each a
+    ;; key of an eq?-table), replaces ~40 random cells every 2 ms (old ->
+    ;; young stores, allocation interleaved with the main place's
+    ;; collections) and on 'check verifies every cell and its table entry
+    ;; (a plain submodule: instantiating it does not run this module's
+    ;; command-line dispatch in the place)
     (set! gc-place
-          (place ch
-                 (let loop ([l '()] [i 0])
-                   (sync/timeout 0.005 ch)
-                   (if (> i 200)
-                       (loop '() 0)
-                       (loop (cons (make-vector 8 i) l) (add1 i))))))
+          (dynamic-place `(submod (file ,(path->string (variable-reference->module-source
+                                                         (#%variable-reference))))
+                                  gc-worker)
+                         'start))
     (sleep 0.05)))
+
+;; #t when the background place's heap is intact
+(define (gc-place-ok?)
+  (place-channel-put gc-place 'check)
+  (sync/timeout 20 gc-place))
 
 (define chez-trip (vm-eval 'collect-trip-bytes))
 (define chez-ipmg (vm-eval 'in-place-minimum-generation))
@@ -815,7 +856,11 @@
   (restore!)
   (gc-restore!)
   (define heap-errs (if check-heap? (heap-check-errors) 0))
+  (define place-ok (if (gc-variant? variant) (gc-place-ok?) #t))
   (cond
+    [(not place-ok)
+     (list "exn" (get-output-string out) "heap-check"
+           "internal error: the background place's heap is damaged after the case")]
     [(positive? heap-errs)
      (list "exn" (get-output-string out) "heap-check"
            (format "internal error: ~a Chez heap check errors after the case" heap-errs))]

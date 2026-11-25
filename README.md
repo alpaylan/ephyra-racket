@@ -179,6 +179,11 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `$check-heap-errors` increase becomes an `exn` line with `internal error: N Chez heap check
      errors`, oracle kind `internal`). `gczo` = compile + zo round trip, `gcsplit` = split + zo
      round trip of each module. `racket runner.rkt macrodump prog.rkt gc` prints the rewrite.
+     The place (`gc-worker` submodule, started with `dynamic-place` so the runner's command-line
+     dispatch does not run in it) keeps 4000 cells of its own (vector, flonum, list, bytes, box
+     of a bignum), each a key of an eq?-table, replaces ~40 random cells every 2 ms, and after
+     every gc-variant case is asked to verify all cells and table entries; a failure becomes
+     `internal error: the background place's heap is damaged after the case`.
      They get about a quarter of the drawn cases. Cost: ~0.17-0.22 s per case vs 0.06 s default.
      A 25-program probe on the coverage build reached +12 000 C regions (gc.c, gc-par.inc,
      gc-oce.inc) over the cumulative profile.
