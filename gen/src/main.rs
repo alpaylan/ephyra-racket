@@ -119,7 +119,7 @@ struct Pair {
 /// `jitify` is not a runner.rkt variant: it runs on server `d` (env
 /// PLT_CS_COMPILE_LIMIT=10) with variant `none`.
 const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
-                            "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit"];
+                            "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -127,8 +127,8 @@ const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big
 const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
                                 "split", "splitzo", "splitmi", "split", "splitzo", "splitmi",
                                 "split", "splitzo", "splitmi",
-                                "macro", "macrozo", "macrosplit", "macro", "macrozo", "macrosplit",
-                                "macro", "macrozo", "macrosplit"];
+                                "macro", "macrozo", "macrosplit", "macrosub", "macro", "macrozo", "macrosplit",
+                                "macrosub", "macro", "macrozo", "macrosplit", "macrosub"];
 
 /// `#:unsafe` is only specified when the safe run raises no exn:fail:contract
 /// (syntax.scrbl).  Conservative: the safe machine-code run finished `ok`

@@ -124,7 +124,13 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      equal the unrewritten module's. `macro` evals in-memory, `macrozo` compiles + writes + reads
      back, `macrosplit` splits (as `split`), rewrites both modules with the macros defined in `a`
      (exported by `all-defined-out`) and round-trips each through a .zo, so `m` expands against
-     deserialized macros. `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten
+     deserialized macros; `macrosub` puts the client part into a `(module* sub #f ...)` submodule of
+     the provider (enclosing bindings and macros through a shifted module path index), zo round
+     trip, then instantiates `(submod 'm sub)`. Also in `wrap-arg`: `m-flip` (a
+     `make-syntax-introducer` applied twice), `m-lintro` (`syntax-local-introduce` twice),
+     `m-reflect` (`datum->syntax` from the argument's own uniform context), `m-lexp`/`m-lexp-stop`
+     (`local-expand` of the argument to core forms, or with a stop list, then re-expanded).
+     `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten
      module(s). They get a third of the drawn cases.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.

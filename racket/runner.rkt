@@ -40,8 +40,10 @@
 ;;   macrosplit  split first, then rewritten; the macros are defined in `a`
 ;;            and used by `m` after a zo round trip of `a` (imported macros,
 ;;            shifted multi-scopes, deserialized syntax)
+;;   macrosub  as macrosplit, the client a (module* sub #f ...) submodule
+;;            of the provider (macro-sub below)
 (define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
-                   "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit"))
+                   "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -186,12 +188,13 @@
     (define-syntax m-define
       (syntax-rules ()
         [(_ (f . args) b ...) (begin (define ,(n 7) 'm-define) (define (f . args) b ...))]))
+    (begin-for-syntax (define (m-dec k) (sub1 k)))
     (define-syntax (m-deep stx)
       (syntax-case stx ()
         [(_ k e) (let ([k* (syntax-e #'k)])
                    (if (zero? k*)
                        #'e
-                       (with-syntax ([km (sub1 k*)])
+                       (with-syntax ([km (m-dec k*)])
                          #'(let ([,(n 8) k]) (m-deep km e)))))]))
     (define-syntax-rule (m-tap e) (let ([tap 'm-tap] [mv 'm-tap] [tmp 'm-tap]) e))
     ;; scope operations on the argument that must cancel out: an introducer
@@ -206,6 +209,16 @@
       (syntax-case stx ()
         [(_ e) (with-syntax ([e* (syntax-local-introduce (syntax-local-introduce #'e))])
                  #'(let ([,(n 10) 'm-lintro]) e*))]))
+    ;; local-expand: the argument fully expanded to core forms inside the
+    ;; transformer, then re-expanded as already-expanded syntax; with a
+    ;; stop list (#%app) only the head is expanded
+    (define-syntax (m-lexp stx)
+      (syntax-case stx ()
+        [(_ e) (local-expand #'e 'expression '())]))
+    (define-syntax (m-lexp-stop stx)
+      (syntax-case stx ()
+        [(_ e) (with-syntax ([e* (local-expand #'e 'expression (list #'#%app #'if))])
+                 #'(let ([,(n 12) 'm-lexp]) e*))]))
     (define-syntax (m-reflect stx)
       (syntax-case stx ()
         [(_ e) (with-syntax ([e* (datum->syntax #'e (syntax->datum #'e) #'e #'e)])
@@ -225,6 +238,7 @@
     (cond [(pick 12) `(m-deep ,(add1 (rng 40)) ,e*)]
           [(pick 15) `(m-tap ,e*)]
           [(pick 25) `(,(case (rng 3) [(0) 'm-flip] [(1) 'm-lintro] [else 'm-reflect]) ,e*)]
+          [(pick 20) `(,(if (zero? (rng 2)) 'm-lexp 'm-lexp-stop) ,e*)]
           [else e*]))
   (define (body bs ren) (map (lambda (b) (ex b ren)) bs))
   (define (bindings bs ren)
@@ -370,6 +384,21 @@
         (let ([x (list-ref l (rng (length l)))])
           (loop (remq x l) (cons x acc))))))
 
+;; macrosub: as macrosplit, but the client is a `(module* sub #f ...)`
+;; submodule of the provider (enclosing module's bindings and macros seen
+;; through a shifted module path index: multi-scopes), instantiated after
+;; the enclosing module by (dynamic-require '(submod 'm sub) #f).  The
+;; enclosing module is `m` so the runner's (dynamic-require ''m #f) runs it.
+(define (macro-sub form src)
+  (define ms (macro-split form src))
+  (define a (car ms))
+  (define m (cadr ms))
+  ;; a = (module a lang (require (for-syntax racket/base)) (provide ...) <body>)
+  ;; m = (module m lang (require (for-syntax racket/base)) <reqs> (require 'a) <items>)
+  (define m-items (filter (lambda (f) (not (and (pair? f) (eq? (car f) 'require)))) (cdddr m)))
+  `(module m ,(caddr a) ,@(cdddr a)
+     (module* sub #f ,@m-items)))
+
 ;; split first (setters for set! across modules), then rewrite both; the
 ;; macros live in `a` and are exported by (all-defined-out) to `m`.
 (define (macro-split form src)
@@ -494,8 +523,12 @@
                      [("macrozo") (eval (zo-round-trip (compile (macro-module form src))))]
                      [("macrosplit")
                       (for ([f (macro-split form src)]) (eval (zo-round-trip (compile f))))]
+                     [("macrosub")
+                      (eval (zo-round-trip (compile (macro-sub form src))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
+                   (when (equal? variant "macrosub")
+                     (dynamic-require '(submod 'm sub) #f))
                    (list "ok" (get-output-string out)))))))))
   (define done (sync/timeout TIMEOUT th))
   (custodian-shutdown-all cust)
@@ -540,8 +573,9 @@
    ;; prints the rewritten module(s) of the macro variants (for triage)
    (let* ([src (call-with-input-file (vector-ref args 1) port->string)]
           [form (read (open-input-string src))])
-     (for ([f (if (equal? (vector-ref args 2) "macrosplit")
-                  (macro-split form src)
-                  (list (macro-module form src)))])
+     (for ([f (case (vector-ref args 2)
+                [("macrosplit") (macro-split form src)]
+                [("macrosub") (list (macro-sub form src))]
+                [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])
