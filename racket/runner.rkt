@@ -25,7 +25,16 @@
 ;;   ctx      compile-context-preservation-enabled #t (schemify inline? = #f)
 ;;   noconst  compile-enforce-module-constants #f
 ;;   cp0big   larger cp0 inlining budgets and outer-loop unrolling
-(define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big"))
+;;   zo       `compile` (serializable), write + read back, eval
+;;   machind  machine-independent compile, write + read back,
+;;            compiled-expression-recompile, eval
+(define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"))
+
+(define (zo-round-trip c)
+  (define o (open-output-bytes))
+  (write c o)
+  (parameterize ([read-accept-compiled #t])
+    (read (open-input-bytes (get-output-bytes o)))))
 (define chez-run-cp0 (vm-eval 'run-cp0))
 (define chez-type-recovery (vm-eval 'enable-type-recovery))
 (define chez-score (vm-eval 'cp0-score-limit))
@@ -104,7 +113,17 @@
                                   (lambda (v) (list "raise" (get-output-string out)
                                                     (format "~s" v)))])
                    (define form (read (open-input-string src)))
-                   (eval form)
+                   (case variant
+                     [("zo")
+                      ;; serializable compile, written and read back as raco make does
+                      (eval (zo-round-trip (compile form)))]
+                     [("machind")
+                      ;; machine-independent compile, round trip, recompile
+                      (eval (compiled-expression-recompile
+                             (zo-round-trip
+                              (parameterize ([current-compile-target-machine #f])
+                                (compile form)))))]
+                     [else (eval form)])
                    (dynamic-require ''m #f)
                    (list "ok" (get-output-string out)))))))))
   (define done (sync/timeout TIMEOUT th))

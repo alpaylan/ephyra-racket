@@ -66,6 +66,10 @@ Median program 103 nodes / 1.2 KB, median 2 loops, 4 ifs, 3 control forms.
    - `ctx`: `compile-context-preservation-enabled #t` (schemify `inline?` #f; eval.scrbl: it only
      avoids optimizations that lose stack-trace information).
    - `noconst`: `compile-enforce-module-constants #f` (schemify's known-binding analysis).
+   - `zo`: `compile` (serializable linklets), `write`, `read` back with `read-accept-compiled`,
+     `eval` — the `raco make` path (serializable schemify, literal lifting, fasl of machine code).
+   - `machind`: same with `current-compile-target-machine #f`, then
+     `compiled-expression-recompile` (machine-independent form recompiled through schemify).
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

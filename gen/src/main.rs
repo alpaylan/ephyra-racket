@@ -102,7 +102,7 @@ struct Pair {
 /// Optimizer variants run on server `c` (runner.rkt VARIANTS); each case
 /// gets one, kept fixed while that case is shrunk.  The variant name is the
 /// oracle name of its signatures.
-const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big"];
+const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind"];
 
 /// `#:unsafe` is only specified when the safe run raises no exn:fail:contract
 /// (syntax.scrbl).  Conservative: the safe machine-code run finished `ok`
