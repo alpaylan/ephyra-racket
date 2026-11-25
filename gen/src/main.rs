@@ -129,7 +129,8 @@ struct Pair {
 /// PLT_CS_COMPILE_LIMIT=10) with variant `none`.
 const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
                             "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub",
-                            "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit", "ref93"];
+                            "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit", "ref93",
+                            "local", "localpart", "localzo"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -145,7 +146,11 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "gc", "gc", "gc", "gc", "gc", "gczo", "gczo", "gczo", "gczo",
                                 "gcsplit", "gcsplit", "gcsplit", "gcsplit", "gcsplit",
                                 "ref93", "ref93", "ref93", "ref93", "ref93", "ref93", "ref93", "ref93",
-                                "ref93", "ref93", "ref93", "ref93", "ref93", "ref93"];
+                                "ref93", "ref93", "ref93", "ref93", "ref93", "ref93",
+                                "local", "local", "local", "local", "local", "local", "local", "local",
+                                "localpart", "localpart", "localpart", "localpart", "localpart",
+                                "localpart", "localpart", "localpart", "localzo", "localzo", "localzo",
+                                "localzo"];
 
 /// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
 /// in 9.3: a case using one is not sent to the 9.3 server.
