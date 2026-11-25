@@ -110,6 +110,10 @@ struct Pair {
     c: Server,
     /// machine code in jitify mode (variant `jitify`), started on first use
     d: Option<Server>,
+    /// machine code under GC stress (variants gc, gczo, gcsplit: runner.rkt
+    /// starts a background place there, so it is kept apart from `c`),
+    /// started on first use
+    e: Option<Server>,
     restarts: u64,
 }
 
@@ -120,7 +124,7 @@ struct Pair {
 /// PLT_CS_COMPILE_LIMIT=10) with variant `none`.
 const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
                             "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub",
-                            "opaque", "opaquesplit"];
+                            "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -131,7 +135,10 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "macro", "macrozo", "macrosplit", "macrosub", "macro", "macrozo", "macrosplit",
                                 "macrosub", "macro", "macrozo", "macrosplit", "macrosub",
                                 "opaque", "opaque", "opaque", "opaque", "opaque", "opaque", "opaque",
-                                "opaque", "opaquesplit", "opaquesplit", "opaquesplit", "opaquesplit"];
+                                "opaque", "opaquesplit", "opaquesplit", "opaquesplit", "opaquesplit",
+                                "ctlnoise", "ctlnoise", "ctlsplit", "ctlsplit",
+                                "gc", "gc", "gc", "gc", "gc", "gczo", "gczo", "gczo", "gczo",
+                                "gcsplit", "gcsplit", "gcsplit", "gcsplit", "gcsplit"];
 
 /// `#:unsafe` is only specified when the safe run raises no exn:fail:contract
 /// (syntax.scrbl).  Conservative: the safe machine-code run finished `ok`
@@ -149,7 +156,7 @@ impl Pair {
         let a = spawn_server(&racket, &runner, false);
         let b = spawn_server(&racket, &runner, true);
         let c = spawn_server(&racket, &runner, false);
-        Pair { racket, runner, a, b, c, d: None, restarts: 0 }
+        Pair { racket, runner, a, b, c, d: None, e: None, restarts: 0 }
     }
     fn send(s: &mut Server, prog: &str) -> bool {
         Self::send_v(s, prog, "none")
@@ -187,11 +194,17 @@ impl Pair {
         if jit && self.d.is_none() {
             self.d = Some(spawn_server_jit(&self.racket, &self.runner, false, true));
         }
-        let (cv, wire) = if jit { (self.d.as_mut().unwrap(), "none") } else { (&mut self.c, variant) };
+        let gcv = variant.starts_with("gc");
+        if gcv && self.e.is_none() {
+            self.e = Some(spawn_server(&self.racket, &self.runner, false));
+        }
+        let (cv, wire) = if jit { (self.d.as_mut().unwrap(), "none") }
+                         else if gcv { (self.e.as_mut().unwrap(), variant) }
+                         else { (&mut self.c, variant) };
         let sc_early = if variant != "unsafe" { Some(Self::send_v(cv, prog, wire)) } else { None };
         let ra = Self::recv(&mut self.a, sa, lim);
         let rc = if variant != "unsafe" || unsafe_eligible(&ra) {
-            let cv = if jit { self.d.as_mut().unwrap() } else { &mut self.c };
+            let cv = if jit { self.d.as_mut().unwrap() } else if gcv { self.e.as_mut().unwrap() } else { &mut self.c };
             let sc = match sc_early { Some(x) => x, None => Self::send_v(cv, prog, wire) };
             let rc = Self::recv(cv, sc, lim);
             if !matches!(rc, Res::Line(_)) {
@@ -224,8 +237,10 @@ impl Pair {
         drop(self.b.stdin);
         drop(self.c.stdin);
         let mut d = self.d.take().map(|d| { drop(d.stdin); d.child });
+        let mut e = self.e.take().map(|e| { drop(e.stdin); e.child });
         let mut children = vec![&mut self.a.child, &mut self.b.child, &mut self.c.child];
         if let Some(dc) = d.as_mut() { children.push(dc); }
+        if let Some(ec) = e.as_mut() { children.push(ec); }
         for c in children {
             let t = Instant::now();
             loop {

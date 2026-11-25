@@ -158,7 +158,30 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      expression, `dynamic-wind` with `void` thunks, application of an empty composable continuation
      (rumble control.ss metacontinuation frames, mark splices, winders). `ctlsplit` = split + zo.
      `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten module(s) for all four.
-     The opaque/ctl variants get about a third of the drawn cases.
+     The opaque/ctl variants get about a third of the drawn cases (ctlnoise/ctlsplit were only
+     added to the draw table in steering round 6).
+   - `gc`, `gczo`, `gcsplit` (metamorphic, steering round 6; runner.rkt `gc-module`,
+     `set-gc-knobs!`): garbage collection must not change results. They run on a fifth server
+     (`e` in main.rs, started on first use) because the runner starts a background place there
+     (a second Chez thread with `thread-preserve-ownership!`, rumble place.ss), which makes Chez
+     use the parallel collector (`gc-par.inc`, never entered before). The opaque sites are
+     wrapped in `(gc-v e)`: the value is kept in a 5000-slot (large-object) vector together with a
+     weak box and an ephemeron, or every 5th time a captured, never-invoked full continuation and
+     the current marks; the cell is a key of a `make-hasheq` and a `make-weak-hasheq` table; then
+     `(collect-garbage 'minor)` (every 97th call, up to 4 times, `'major`); then a cell kept 3
+     calls earlier must still be found in both tables with its number, else
+     `internal error: kept key lost ...` is raised (address-hashed tables are rehashed when keys
+     move; universal: no data loss). Per case (deterministic in the text): `collect-trip-bytes`
+     64 KB-4 MB (collections at arbitrary allocation points, also inside the expander, schemify,
+     the Chez compiler and the fasl reader), `in-place-minimum-generation` 0/1/default (marking
+     in place instead of copying; cf. 6e3d35902a), object counts on for 1/4 (`gc-oce.inc`), and
+     for 1/16 a Chez heap check after the case (`$enable-check-heap` + a minor collection; any
+     `$check-heap-errors` increase becomes an `exn` line with `internal error: N Chez heap check
+     errors`, oracle kind `internal`). `gczo` = compile + zo round trip, `gcsplit` = split + zo
+     round trip of each module. `racket runner.rkt macrodump prog.rkt gc` prints the rewrite.
+     They get about a quarter of the drawn cases. Cost: ~0.17-0.22 s per case vs 0.06 s default.
+     A 25-program probe on the coverage build reached +12 000 C regions (gc.c, gc-par.inc,
+     gc-oce.inc) over the cumulative profile.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

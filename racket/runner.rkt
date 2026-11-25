@@ -14,7 +14,7 @@
 ;;   timeout <output>
 ;;   oom
 (require racket/port racket/fixnum racket/flonum racket/unsafe/ops racket/list
-         racket/string racket/pretty ffi/unsafe/vm)
+         racket/string racket/pretty ffi/unsafe/vm racket/place)
 
 ;; Optimizer variants (third oracle, README.md "Variants"): the same module
 ;; compiled to machine code with one compiler toggle changed.
@@ -55,9 +55,15 @@
 ;;            continuation (rumble control.ss: metacontinuation frames,
 ;;            mark splices, winders)
 ;;   ctlsplit ctlnoise, then split, each module through a zo round trip
+;;   gc       GC stress (gc-module below): sites wrapped in `gc-v` (keep the
+;;            value in old objects and eq/weak tables, collect, check the
+;;            tables), small collect-trip-bytes, in-place marking, object
+;;            counts, a background place (parallel collector), heap check
+;;   gczo     gc, compiled, written and read back
+;;   gcsplit  gc, then split, each module through a zo round trip
 (define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
                    "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"
-                   "opaque" "opaquesplit" "ctlnoise" "ctlsplit"))
+                   "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -485,7 +491,9 @@
   (define (lambda-form? e) (and (pair? e) (memq (car e) '(lambda case-lambda))))
   (define (literal? e) (or (number? e) (boolean? e) (char? e) (string? e)
                            (and (pair? e) (eq? (car e) 'quote))))
-  (define (opq e) (if ctl? (ctl-wrap e rng) `(opq-v ,e)))
+  (define (opq e) (cond [(eq? ctl? 'gc) `(gc-v ,e)]
+                        [ctl? (ctl-wrap e rng)]
+                        [else `(opq-v ,e)]))
   ;; a single-valued, non-tail position
   (define (arg e)
     (define e* (ex e))
@@ -576,6 +584,104 @@
   `(module m ,lang ,@pre ,@(if ctl? ctl-defs opaque-defs)
      ,@(opaque-rewrite-items items (cdddr form) rng ctl?)))
 
+;; ---------------------------------------------------------------------
+;; GC stress (variants gc, gczo, gcsplit; steering round 6).  Garbage
+;; collection must not change results (universal: no wrong result; nothing
+;; in the program observes memory, weak boxes or finalizers).  The same
+;; sites as the opaque rewrite are wrapped in `(gc-v e)`, which evaluates
+;; `e`, keeps its value in a large old vector (old->young stores into a
+;; large object, card marking) and in a weak box, runs a minor collection
+;; (now and then a major one) and returns the value.  Around the case the
+;; runner lowers `collect-trip-bytes` (collections at arbitrary allocation
+;; points, also inside the expander/schemify/Chez compiler and the fasl
+;; reader), sometimes `in-place-minimum-generation` (mark in place instead
+;; of copying), sometimes enables object counts (the gc-oce collector),
+;; and a background place makes Chez use the parallel collector
+;; (gc-par.inc; rumble place.ss thread-preserve-ownership!).  Some cases end
+;; with a Chez heap check ($enable-check-heap + a collection); any heap
+;; error is reported as an internal error.
+(define gc-defs
+  '((define gc-keep (make-vector 5000 #f))
+    (define gc-n 0)
+    ;; every kept cell is a key of an eq?-table and a weak eq?-table (keys
+    ;; move when collected: address-hashed tables must be rehashed); a
+    ;; cell kept a few calls ago must still be found in both with its
+    ;; number, else the collector lost or misplaced it
+    (define gc-eq (make-hasheq))
+    (define gc-weq (make-weak-hasheq))
+    (define (gc-v x)
+      (set! gc-n (add1 gc-n))
+      (let* ([i (modulo gc-n 5000)]
+             [old (vector-ref gc-keep i)]
+             [cell (if (zero? (modulo gc-n 5))
+                       ;; a captured (never invoked) continuation and marks
+                       ;; kept alive across collections
+                       (vector gc-n x (call-with-current-continuation (lambda (k) k))
+                               (current-continuation-marks))
+                       (vector gc-n x (make-weak-box x) (make-ephemeron x gc-n)))])
+        (when old (hash-remove! gc-eq old))
+        (vector-set! gc-keep i cell)
+        (hash-set! gc-eq cell gc-n)
+        (hash-set! gc-weq cell gc-n)
+        (collect-garbage (if (and (zero? (modulo gc-n 97)) (< gc-n 400)) 'major 'minor))
+        (let ([c (vector-ref gc-keep (modulo (- gc-n 3) 5000))])
+          (when (and c (not (and (eqv? (hash-ref gc-eq c #f) (vector-ref c 0))
+                                 (eqv? (hash-ref gc-weq c #f) (vector-ref c 0)))))
+            (error 'gc-v "internal error: kept key lost from an eq table after a collection"))))
+      x)))
+
+(define (gc-module form src)
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append "gc" src)))
+  `(module m ,lang ,@pre ,@gc-defs
+     ,@(opaque-rewrite-items items (cdddr form) rng 'gc)))
+
+(define gc-place #f)
+(define (start-gc-place!)
+  (unless gc-place
+    ;; an idle-ish place: a second Chez thread with preserved ownership,
+    ;; so collections go through the parallel collector
+    (set! gc-place
+          (place ch
+                 (let loop ([l '()] [i 0])
+                   (sync/timeout 0.005 ch)
+                   (if (> i 200)
+                       (loop '() 0)
+                       (loop (cons (make-vector 8 i) l) (add1 i))))))
+    (sleep 0.05)))
+
+(define chez-trip (vm-eval 'collect-trip-bytes))
+(define chez-ipmg (vm-eval 'in-place-minimum-generation))
+(define chez-eoc (vm-eval 'enable-object-counts))
+(define chez-check-heap (vm-eval '($primitive $enable-check-heap)))
+(define chez-heap-errors (vm-eval '($primitive $check-heap-errors)))
+
+(define (gc-variant? v) (member v '("gc" "gczo" "gcsplit")))
+
+;; returns (values restore-thunk check-heap?)
+(define (set-gc-knobs! src)
+  (define rng (macro-rng (string-append "gcknobs" src)))
+  (start-gc-place!)
+  (define trip (chez-trip))
+  (define ipmg (chez-ipmg))
+  (define eoc (chez-eoc))
+  (chez-trip (vector-ref #(65536 262144 1048576 4194304) (rng 4)))
+  (case (rng 3)
+    [(0) (chez-ipmg 0)]
+    [(1) (chez-ipmg 1)]
+    [else (void)])
+  (when (zero? (rng 4)) (chez-eoc #t))
+  (values (lambda () (chez-trip trip) (chez-ipmg ipmg) (chez-eoc eoc))
+          (zero? (rng 16))))
+
+(define (heap-check-errors)
+  (define before (chez-heap-errors))
+  (chez-check-heap #t)
+  (collect-garbage 'minor)
+  (chez-check-heap #f)
+  (- (chez-heap-errors) before))
+
 (define (zo-round-trip c)
   (define o (open-output-bytes))
   (write c o)
@@ -634,6 +740,8 @@
   (custodian-limit-memory cust (* 2048 1024 1024) cust)
   (define result #f)
   (define restore! (set-chez-knobs! variant))
+  (define-values (gc-restore! check-heap?)
+    (if (gc-variant? variant) (set-gc-knobs! src) (values void #f)))
   (define th
     (parameterize ([current-custodian cust]
                    [compile-context-preservation-enabled (equal? variant "ctx")]
@@ -692,6 +800,11 @@
                      [("ctlsplit")
                       (for ([f (split-module (opaque-module form src #t))])
                         (eval (zo-round-trip (compile f))))]
+                     [("gc") (eval (gc-module form src))]
+                     [("gczo") (eval (zo-round-trip (compile (gc-module form src))))]
+                     [("gcsplit")
+                      (for ([f (split-module (gc-module form src))])
+                        (eval (zo-round-trip (compile f))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
                    (when (equal? variant "macrosub")
@@ -700,7 +813,12 @@
   (define done (sync/timeout TIMEOUT th))
   (custodian-shutdown-all cust)
   (restore!)
+  (gc-restore!)
+  (define heap-errs (if check-heap? (heap-check-errors) 0))
   (cond
+    [(positive? heap-errs)
+     (list "exn" (get-output-string out) "heap-check"
+           (format "internal error: ~a Chez heap check errors after the case" heap-errs))]
     [(not done) (list "timeout" (get-output-string out))]
     [(not result) (list "oom")]
     [else result]))
@@ -747,6 +865,8 @@
                 [("opaquesplit") (split-module (opaque-module form src))]
                 [("ctlnoise") (list (opaque-module form src #t))]
                 [("ctlsplit") (split-module (opaque-module form src #t))]
+                [("gc" "gczo") (list (gc-module form src))]
+                [("gcsplit") (split-module (gc-module form src))]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])
