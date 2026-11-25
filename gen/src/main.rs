@@ -130,7 +130,7 @@ struct Pair {
 const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
                             "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub",
                             "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit", "ref93",
-                            "local", "localpart", "localzo"];
+                            "local", "localpart", "localzo", "preempt", "preemptctl", "preemptsplit"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -150,7 +150,14 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "local", "local", "local", "local", "local", "local", "local", "local",
                                 "localpart", "localpart", "localpart", "localpart", "localpart",
                                 "localpart", "localpart", "localpart", "localzo", "localzo", "localzo",
-                                "localzo"];
+                                "localzo",
+                                // steering round 9: preemption at arbitrary event checks
+                                "preempt", "preempt", "preempt", "preempt", "preempt", "preempt",
+                                "preempt", "preempt", "preempt", "preempt", "preempt", "preempt",
+                                "preemptctl", "preemptctl", "preemptctl", "preemptctl", "preemptctl",
+                                "preemptctl", "preemptctl", "preemptctl",
+                                "preemptsplit", "preemptsplit", "preemptsplit", "preemptsplit",
+                                "preemptsplit", "preemptsplit", "preemptsplit", "preemptsplit"];
 
 /// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
 /// in 9.3: a case using one is not sent to the 9.3 server.
@@ -664,6 +671,16 @@ else
   c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
 fi
 rc=$(res "$c")
+# preempt*: where the timer fires during compilation depends on timing, so
+# a run that matches is retried twice (the program's own sites are
+# deterministic in ticks, the expander/compiler's swaps are not)
+case "$VAR" in preempt*)
+  for t in 1 2; do
+    [ "$KIND" != died ] && [ "$KIND" != hang ] && [ -n "$rc" ] && [ "$ra" = "$rc" ] || break
+    c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
+    rc=$(res "$c")
+  done ;;
+esac
 case $KIND in
   died)
     if [ "$cc" != 0 ] && [ "$cc" != 124 ] && [ "$cc" != 137 ] && [ -z "$rc" ]; then exit 1; fi

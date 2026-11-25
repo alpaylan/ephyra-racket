@@ -283,6 +283,25 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (`letrec-syntaxes+values`, left to right) semantics give the same output. `localzo` =
      `localpart` + zo round trip. About a fifth of the drawn cases.
      `racket runner.rkt macrodump prog.rkt local` prints the rewrite.
+   - `preempt`, `preemptctl`, `preemptsplit` (metamorphic, steering round 9; runner.rkt
+     `preempt-module`, `start-preempt-helper!`): green-thread preemption must not change results.
+     Racket threads are Chez engines (rumble engine.ss); when the engine timer runs out at an event
+     check (procedure entry, loop back-edge) the timer interrupt captures the metacontinuation and
+     the scheduler swaps threads — normally once per 100 000 ticks (thread/config.rkt TICKS), so
+     almost never inside user code. Here the opaque sites (denser) and the start of half of the
+     function bodies are wrapped in `(pre-v e)`, which evaluates `e` and lowers the remaining ticks
+     (Chez `set-timer`, via `vm-primitive`) to 1..K, K per program 2/8/32/400, so the interrupt fires
+     at an arbitrary later event check: inside loops with unboxed flonum locals, prompts,
+     dynamic-wind, parameterize, marks, handlers, composable-continuation applications. A helper
+     green thread (output discarded) is always runnable; it yields with `(sleep 0)` inside its own
+     parameterize + mark and checks that they, a flonum accumulator and a ring of vectors survive
+     swaps (failure: `internal error: helper's ...`, kind `internal`). `preemptctl` wraps a third of
+     the sites in the ctlnoise forms instead, `preemptsplit` = split + zo round trip of each module.
+     Expected: a thread switch is not observable by a thread that shares no state with others
+     (universal: no wrong result). `RKT_PRE_DEBUG=1` makes the runner print the helper's iteration
+     count (≈ swaps) to stderr. The repro retries a matching variant run twice (swaps during
+     compilation depend on timing). About a fifth of the drawn cases; `macrodump prog.rkt preempt`
+     prints the rewrite.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

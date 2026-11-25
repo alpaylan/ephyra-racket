@@ -61,10 +61,17 @@
 ;;            counts, a background place (parallel collector), heap check
 ;;   gczo     gc, compiled, written and read back
 ;;   gcsplit  gc, then split, each module through a zo round trip
+;;   local, localpart, localzo  items moved into an internal-definition body
+;;   preempt  green-thread preemption at arbitrary points (preempt-module):
+;;            sites wrapped in `pre-v`, which arms the Chez timer a few ticks
+;;            ahead, so the engine's timer interrupt swaps the case thread out
+;;            (to a helper thread) at a later event check
+;;   preemptctl  preempt, some sites wrapped in the ctlnoise forms instead
+;;   preemptsplit  preempt, then split, each module through a zo round trip
 (define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
                    "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"
                    "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"
-                   "local" "localpart" "localzo"))
+                   "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -483,9 +490,13 @@
                                               (regexp-match? #rx"^[a-z]+[0-9]+$" (symbol->string h)))))
   (define (prim-head? h) (and (symbol? h) (not (user-head? h)) (base-procs h)))
   ;; per-program profile
-  (define p-lit (vector-ref #(2 3 5) (rng 3)))     ; 1/k literals
-  (define p-var (vector-ref #(3 6 20) (rng 3)))    ; 1/k variable references
-  (define p-expr (vector-ref #(6 12 40) (rng 3)))  ; 1/k other subexpressions
+  (define pre? (memq ctl? '(pre prectl)))
+  (define p-lit (vector-ref (if pre? #(1 2 5) #(2 3 5)) (rng 3)))     ; 1/k literals
+  (define p-var (vector-ref (if pre? #(1 2 6) #(3 6 20)) (rng 3)))    ; 1/k variable references
+  (define p-expr (vector-ref (if pre? #(2 3 12) #(6 12 40)) (rng 3)))  ; 1/k other subexpressions
+  ;; preempt: also arm the timer at the start of 1/k function bodies
+  (define p-entry (if pre? (vector-ref #(1 2 1000000) (rng 3)) 1000000))
+  (define (prologue bs) (if (pick p-entry) (cons '(pre-v (void)) bs) bs))
   (define p-user (vector-ref #(1 2 4) (rng 3)))    ; 1/k user callees
   (define p-prim (vector-ref #(1 2 4 1000000) (rng 4))) ; 1/k primitive callees
   (define (pick k) (zero? (rng k)))
@@ -493,6 +504,8 @@
   (define (literal? e) (or (number? e) (boolean? e) (char? e) (string? e)
                            (and (pair? e) (eq? (car e) 'quote))))
   (define (opq e) (cond [(eq? ctl? 'gc) `(gc-v ,e)]
+                        [(eq? ctl? 'pre) `(pre-v ,e)]
+                        [(eq? ctl? 'prectl) (if (pick 3) (ctl-wrap e rng) `(pre-v ,e))]
                         [ctl? (ctl-wrap e rng)]
                         [else `(opq-v ,e)]))
   ;; a single-valued, non-tail position
@@ -534,9 +547,9 @@
               `(let-values ,(for/list ([b (cadr e)]) (list (car b) (ex (cadr b)))) ,@(body (cddr e)))
               e)]
          [(lambda)
-          (if (>= n 3) `(lambda ,(cadr e) ,@(body (cddr e))) e)]
+          (if (>= n 3) `(lambda ,(cadr e) ,@(prologue (body (cddr e)))) e)]
          [(define)
-          (cond [(and (pair? (cadr e)) (>= n 3)) `(define ,(cadr e) ,@(body (cddr e)))]
+          (cond [(and (pair? (cadr e)) (>= n 3)) `(define ,(cadr e) ,@(prologue (body (cddr e))))]
                 [(and (symbol? (cadr e)) (= n 3)) `(define ,(cadr e) ,(arg (caddr e)))]
                 [else e])]
          [(define-values)
@@ -736,6 +749,81 @@
 (define chez-unroll (vm-eval 'cp0-outer-unroll-limit))
 
 ;; ---------------------------------------------------------------------
+;; Preemption (variants preempt, preemptctl, preemptsplit; steering round 9).
+;; Racket threads are Chez engines (rumble engine.ss): when the engine's
+;; timer runs out at an event check (procedure entry, loop back-edge), the
+;; timer interrupt captures the metacontinuation and the scheduler swaps in
+;; another thread; the case thread resumes later where it stopped.  With the
+;; default quantum (thread/config.rkt TICKS 100000) that happens a handful of
+;; times per case at the same few places.  Here the opaque sites are wrapped
+;; in `(pre-v e)`, which evaluates `e`, then lowers the remaining ticks to
+;; 1..K (K per program: 2, 8, 32 or 400), so the interrupt fires at an
+;; arbitrary later event check, also inside loops with unboxed flonum locals,
+;; inside prompts, dynamic-wind, parameterize, marks, handlers and
+;; continuation applications.  A helper green thread (created by the runner,
+;; its output discarded) is always runnable: it yields with `(sleep 0)` inside
+;; its own parameterize + continuation mark and checks that both, a flonum
+;; accumulator and a ring of vectors survive the swaps; a failure becomes an
+;; `internal error` result line.  Expected: thread switches are not
+;; observable by a program that does not share state with other threads
+;; (reference/threads.scrbl: threads run concurrently; nothing allows a
+;; context switch to change a single thread's results), so the output must
+;; equal the default run's.
+(define (preempt-defs src)
+  (define rng (macro-rng (string-append "preK" src)))
+  `((require (only-in ffi/unsafe/vm vm-primitive))
+    (define pre-st (vm-primitive 'set-timer))
+    (define pre-n 0)
+    (define (pre-v x)
+      (set! pre-n (add1 pre-n))
+      (let ([o (pre-st 0)])
+        (pre-st (if (> o 0) (min o (add1 (modulo (* pre-n 7919) ,(vector-ref #(2 8 32 400) (rng 4))))) 0)))
+      x)))
+
+(define (preempt-variant? v) (member v '("preempt" "preemptctl" "preemptsplit")))
+
+(define (preempt-module form src [ctl? #f])
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append "preempt" src)))
+  `(module m ,lang ,@pre ,@(preempt-defs src) ,@(if ctl? ctl-defs '())
+     ,@(opaque-rewrite-items items (cdddr form) rng (if ctl? 'prectl 'pre))))
+
+(define pre-param (make-parameter 0))
+(define pre-swaps 0)   ; helper iterations (RKT_PRE_DEBUG prints them)
+;; the helper thread; sets `fail` to a message when a check fails
+(define (start-preempt-helper! fail)
+  (parameterize ([current-output-port (open-output-nowhere)]
+                 [current-error-port (open-output-nowhere)])
+    (thread
+     (lambda ()
+       (with-handlers ([(lambda (e) #t)
+                        (lambda (e) (set-box! fail (format "helper raised ~a"
+                                                           (if (exn? e) (first-line (exn-message e)) e))))])
+         (define ring (make-vector 32 #f))
+         (let loop ([i 0] [acc 0.0])
+           (define v (vector i (exact->inexact i) (list i (number->string i))))
+           (vector-set! ring (modulo i 32) v)
+           (parameterize ([pre-param i])
+             (with-continuation-mark 'pre-key i
+               (begin
+                 (sleep 0)
+                 (unless (and (eqv? (pre-param) i)
+                              (eqv? (continuation-mark-set-first #f 'pre-key) i))
+                   (set-box! fail "helper's parameterization or mark changed across a swap"))
+                 (void))))
+           (unless (fl= acc (fl* (->fl i) 0.25))
+             (set-box! fail "helper's flonum accumulator changed across a swap"))
+           (when (>= i 32)
+             (define old (vector-ref ring (modulo (- i 31) 32)))
+             (define k (- i 31))
+             (unless (and (eqv? (vector-ref old 0) k) (eqv? (vector-ref old 1) (exact->inexact k))
+                          (equal? (vector-ref old 2) (list k (number->string k))))
+               (set-box! fail "helper's ring vector changed across a swap")))
+           (set! pre-swaps (add1 pre-swaps))
+           (unless (unbox fail) (loop (add1 i) (fl+ acc 0.25)))))))))
+
+;; ---------------------------------------------------------------------
 ;; Metamorphic "local" rewrite (variants local, localpart; steering round 8).
 ;; The generated module-level items (all of them for `local`, a suffix
 ;; chosen from the program text for `localpart`) are moved into the body of
@@ -812,7 +900,7 @@
 
 (define (fresh-ns)
   (define ns (make-base-namespace))
-  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list)])
+  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list ffi/unsafe/vm)])
     (namespace-attach-module orig-ns m ns))
   ns)
 
@@ -827,12 +915,14 @@
   (define restore! (set-chez-knobs! variant))
   (define-values (gc-restore! check-heap?)
     (if (gc-variant? variant) (set-gc-knobs! src) (values void #f)))
+  (define pre-fail (and (preempt-variant? variant) (box #f)))
   (define th
     (parameterize ([current-custodian cust]
                    [compile-context-preservation-enabled (equal? variant "ctx")]
                    [compile-enforce-module-constants (not (equal? variant "noconst"))])
       (thread
        (lambda ()
+         (when pre-fail (start-preempt-helper! pre-fail))
          (set! result
                (parameterize ([current-namespace (fresh-ns)]
                               [current-output-port out]
@@ -893,6 +983,11 @@
                      [("local") (eval (local-module form src))]
                      [("localpart") (eval (local-module form src #t))]
                      [("localzo") (eval (zo-round-trip (compile (local-module form src #t))))]
+                     [("preempt") (eval (preempt-module form src))]
+                     [("preemptctl") (eval (preempt-module form src #t))]
+                     [("preemptsplit")
+                      (for ([f (split-module (preempt-module form src))])
+                        (eval (zo-round-trip (compile f))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
                    (when (equal? variant "macrosub")
@@ -904,7 +999,13 @@
   (gc-restore!)
   (define heap-errs (if check-heap? (heap-check-errors) 0))
   (define place-ok (if (gc-variant? variant) (gc-place-ok?) #t))
+  (when (and pre-fail (getenv "RKT_PRE_DEBUG"))
+    (eprintf "helper iterations: ~a\n" pre-swaps)
+    (set! pre-swaps 0))
   (cond
+    [(and pre-fail (unbox pre-fail))
+     (list "exn" (get-output-string out) "preempt-helper"
+           (format "internal error: ~a" (unbox pre-fail)))]
     [(not place-ok)
      (list "exn" (get-output-string out) "heap-check"
            "internal error: the background place's heap is damaged after the case")]
@@ -961,6 +1062,9 @@
                 [("gcsplit") (split-module (gc-module form src))]
                 [("local") (list (local-module form src))]
                 [("localpart" "localzo") (list (local-module form src #t))]
+                [("preempt") (list (preempt-module form src))]
+                [("preemptctl") (list (preempt-module form src #t))]
+                [("preemptsplit") (split-module (preempt-module form src))]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])
