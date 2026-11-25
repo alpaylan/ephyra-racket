@@ -42,8 +42,22 @@
 ;;            shifted multi-scopes, deserialized syntax)
 ;;   macrosub  as macrosplit, the client a (module* sub #f ...) submodule
 ;;            of the provider (macro-sub below)
+;;   opaque   literals, variable references, subexpressions and callees
+;;            hidden behind a mutable identity `opq-v` (opaque-module below):
+;;            no constant folding, no known-value/known-procedure info, no
+;;            inlining at those sites; inlined primitives become calls of
+;;            the out-of-line library procedures
+;;   opaquesplit  opaque, then split (as split), in-memory
+;;   ctlnoise the same sites instead wrapped in control forms that are the
+;;            identity: a prompt with a fresh tag, an abort to a fresh-tag
+;;            prompt whose handler evaluates the expression, dynamic-wind
+;;            with void thunks, application of an empty composable
+;;            continuation (rumble control.ss: metacontinuation frames,
+;;            mark splices, winders)
+;;   ctlsplit ctlnoise, then split, each module through a zo round trip
 (define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
-                   "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"))
+                   "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"
+                   "opaque" "opaquesplit" "ctlnoise" "ctlsplit"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -416,6 +430,152 @@
         `(module m ,(caddr m) (require (for-syntax racket/base))
            ,@(macro-rewrite-items (cdddr m) all rng))))
 
+;; ---------------------------------------------------------------------
+;; Metamorphic "opaque" rewrite (variants opaque, opaquesplit; steering
+;; round 5).  Selected sites are wrapped in `(opq-v e)`, where `opq-v` is a
+;; module variable holding the identity and `set!` once, so neither
+;; schemify nor Chez cp0/cptypes can see through it: literals stop being
+;; constants (no folding), variable references lose their known
+;; value/type, an application `(f a ...)` becomes `((opq-v f) a ...)`
+;; (no inlining, no known-procedure call; for a primitive the out-of-line
+;; library procedure instead of the inline cpprim code), `if` tests stop
+;; being foldable.  Only positions whose value is a single value and that
+;; are not in tail position are wrapped (application arguments, `if`
+;; tests, `let`/`set!`/`define` right-hand sides that are not lambdas), and
+;; callees keep their tail position, so continuation marks and tail calls
+;; are unchanged; `(opq-v f)` evaluates `f` at the same point as `f` would.
+;; `opq-v` matches no generated name.  Densities are a deterministic
+;; function of the program text.  The output must equal the original's.
+(define opaque-defs
+  '((define (opq-id x) x)
+    (define opq-v opq-id)
+    (set! opq-v opq-id)))
+
+(define ctl-defs
+  '((define opq-tag (make-continuation-prompt-tag 'opq))))
+
+;; ctlnoise wrappers; each evaluates `e` exactly once, in a continuation
+;; that differs from the original only by frames no generated code can
+;; observe (prompts and composable continuations of a tag only these
+;; wrappers use; void winders).  Only used at non-tail positions.
+(define (ctl-wrap e rng)
+  (case (rng 5)
+    [(0) `(call-with-continuation-prompt (lambda () ,e) opq-tag)]
+    [(1) `(call-with-continuation-prompt (lambda () (abort-current-continuation opq-tag (lambda () ,e)))
+                                         opq-tag (lambda (th) (th)))]
+    [(2) `(dynamic-wind void (lambda () ,e) void)]
+    [(3) `((call-with-continuation-prompt
+            (lambda () (call-with-composable-continuation (lambda (k) k) opq-tag)) opq-tag)
+           ,e)]
+    [else `(call-with-continuation-prompt
+            (lambda () (dynamic-wind void (lambda () ,e) void)) opq-tag)]))
+
+(define (opaque-rewrite-items items all-forms rng [ctl? #f])
+  (define fns (user-fn-names all-forms))
+  (define (user-head? h) (and (symbol? h) (or (hash-ref fns h #f)
+                                              (regexp-match? #rx"^[a-z]+[0-9]+$" (symbol->string h)))))
+  (define (prim-head? h) (and (symbol? h) (not (user-head? h)) (base-procs h)))
+  ;; per-program profile
+  (define p-lit (vector-ref #(2 3 5) (rng 3)))     ; 1/k literals
+  (define p-var (vector-ref #(3 6 20) (rng 3)))    ; 1/k variable references
+  (define p-expr (vector-ref #(6 12 40) (rng 3)))  ; 1/k other subexpressions
+  (define p-user (vector-ref #(1 2 4) (rng 3)))    ; 1/k user callees
+  (define p-prim (vector-ref #(1 2 4 1000000) (rng 4))) ; 1/k primitive callees
+  (define (pick k) (zero? (rng k)))
+  (define (lambda-form? e) (and (pair? e) (memq (car e) '(lambda case-lambda))))
+  (define (literal? e) (or (number? e) (boolean? e) (char? e) (string? e)
+                           (and (pair? e) (eq? (car e) 'quote))))
+  (define (opq e) (if ctl? (ctl-wrap e rng) `(opq-v ,e)))
+  ;; a single-valued, non-tail position
+  (define (arg e)
+    (define e* (ex e))
+    (cond [(lambda-form? e) e*]
+          [(literal? e) (if (pick p-lit) (opq e*) e*)]
+          [(symbol? e) (if (pick p-var) (opq e*) e*)]
+          [(pick p-expr) (opq e*)]
+          [else e*]))
+  (define (body bs) (map ex bs))
+  (define (bindings bs) (for/list ([b bs]) (list (car b) (arg (cadr b)))))
+  (define (clauses-ok? bs) (and (list? bs) (andmap (lambda (b) (and (list? b) (= 2 (length b)) (symbol? (car b)))) bs)))
+  (define (ex e)
+    (cond
+      [(not (pair? e)) e]
+      [(not (list? e)) e]
+      [else
+       (define h (car e))
+       (define n (length e))
+       (case h
+         [(quote) e]
+         [(if) (if (= n 4) `(if ,(arg (cadr e)) ,(ex (caddr e)) ,(ex (cadddr e))) e)]
+         [(begin and or when unless show writeln with-continuation-mark)
+          `(,h ,@(body (cdr e)))]
+         [(let)
+          (cond
+            [(and (>= n 3) (symbol? (cadr e)) (clauses-ok? (caddr e)))
+             `(let ,(cadr e) ,(bindings (caddr e)) ,@(body (cdddr e)))]
+            [(and (>= n 3) (clauses-ok? (cadr e)))
+             `(let ,(bindings (cadr e)) ,@(body (cddr e)))]
+            [else e])]
+         [(let* letrec)
+          (if (and (>= n 3) (clauses-ok? (cadr e)))
+              `(,h ,(bindings (cadr e)) ,@(body (cddr e)))
+              e)]
+         [(let-values)
+          (if (>= n 3)
+              `(let-values ,(for/list ([b (cadr e)]) (list (car b) (ex (cadr b)))) ,@(body (cddr e)))
+              e)]
+         [(lambda)
+          (if (>= n 3) `(lambda ,(cadr e) ,@(body (cddr e))) e)]
+         [(define)
+          (cond [(and (pair? (cadr e)) (>= n 3)) `(define ,(cadr e) ,@(body (cddr e)))]
+                [(and (symbol? (cadr e)) (= n 3)) `(define ,(cadr e) ,(arg (caddr e)))]
+                [else e])]
+         [(define-values)
+          (if (= n 3) `(define-values ,(cadr e) ,(ex (caddr e))) e)]
+         [(set!)
+          (if (and (= n 3) (symbol? (cadr e))) `(set! ,(cadr e) ,(arg (caddr e))) e)]
+         [(cond)
+          `(cond ,@(for/list ([c (cdr e)])
+                     (if (and (list? c) (pair? c))
+                         (cons (if (eq? (car c) 'else) 'else (arg (car c)))
+                               (map (lambda (x) (if (eq? x '=>) x (ex x))) (cdr c)))
+                         c)))]
+         [(case)
+          (if (>= n 2)
+              `(case ,(arg (cadr e))
+                 ,@(for/list ([c (cddr e)])
+                     (if (and (list? c) (pair? c)) (cons (car c) (body (cdr c))) c)))
+              e)]
+         [(with-handlers parameterize)
+          (if (and (>= n 3) (list? (cadr e)) (andmap (lambda (c) (and (list? c) (= 2 (length c)))) (cadr e)))
+              `(,h ,(for/list ([c (cadr e)]) (list (ex (car c)) (arg (cadr c)))) ,@(body (cddr e)))
+              e)]
+         [(for/sum for/list for)
+          (if (and (>= n 3) (clauses-ok? (cadr e)))
+              `(,h ,(for/list ([b (cadr e)]) (list (car b) (ex (cadr b)))) ,@(body (cddr e)))
+              e)]
+         [(for/fold)
+          (if (and (>= n 4) (clauses-ok? (cadr e)) (clauses-ok? (caddr e)))
+              `(,h ,(bindings (cadr e)) ,(for/list ([b (caddr e)]) (list (car b) (ex (cadr b))))
+                   ,@(body (cdddr e)))
+              e)]
+         [else
+          (cond
+            [(user-head? h)
+             `(,(if (pick p-user) (opq h) h) ,@(map arg (cdr e)))]
+            [(prim-head? h)
+             `(,(if (pick p-prim) (opq h) h) ,@(map arg (cdr e)))]
+            [(pair? h) (map ex e)]
+            [else e])])]))   ; unknown syntactic form: unchanged
+  (map ex items))
+
+(define (opaque-module form src [ctl? #f])
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append (if ctl? "ctl" "opaque") src)))
+  `(module m ,lang ,@pre ,@(if ctl? ctl-defs opaque-defs)
+     ,@(opaque-rewrite-items items (cdddr form) rng ctl?)))
+
 (define (zo-round-trip c)
   (define o (open-output-bytes))
   (write c o)
@@ -525,6 +685,13 @@
                       (for ([f (macro-split form src)]) (eval (zo-round-trip (compile f))))]
                      [("macrosub")
                       (eval (zo-round-trip (compile (macro-sub form src))))]
+                     [("opaque") (eval (opaque-module form src))]
+                     [("opaquesplit")
+                      (for ([f (split-module (opaque-module form src))]) (eval f))]
+                     [("ctlnoise") (eval (opaque-module form src #t))]
+                     [("ctlsplit")
+                      (for ([f (split-module (opaque-module form src #t))])
+                        (eval (zo-round-trip (compile f))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
                    (when (equal? variant "macrosub")
@@ -576,6 +743,10 @@
      (for ([f (case (vector-ref args 2)
                 [("macrosplit") (macro-split form src)]
                 [("macrosub") (list (macro-sub form src))]
+                [("opaque") (list (opaque-module form src))]
+                [("opaquesplit") (split-module (opaque-module form src))]
+                [("ctlnoise") (list (opaque-module form src #t))]
+                [("ctlsplit") (split-module (opaque-module form src #t))]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])

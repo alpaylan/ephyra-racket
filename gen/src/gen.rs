@@ -539,7 +539,8 @@ impl<'a> Gen<'a> {
     fn control(&mut self, ty: Ty, d: usize) -> E {
         let r = self.rng.below(100);
         match r {
-            0..=29 => {
+            26..=29 => self.delim(ty, d),
+            0..=25 => {
                 // if: bias toward compare tests and trivial arms (cmov shapes)
                 let cd = if self.rng.chance(0.5) { 1.min(d - 1) } else { d - 1 };
                 let c = self.expr(Ty::Bool, cd);
@@ -703,6 +704,98 @@ impl<'a> Gen<'a> {
                 let a = self.expr(Ty::Int, d - 1);
                 let b = self.expr(ty, d - 1);
                 E::node(ty, "begin", "(begin $0 $1)", vec![a, b])
+            }
+        }
+    }
+
+    /// `X` combined with `Y` at type `ty` (Y is the hole of a captured continuation).
+    fn comb(ty: Ty) -> &'static str {
+        match ty {
+            Ty::Int => "(fx+/wraparound X Y)",
+            Ty::Fl => "(fl+ X Y)",
+            Ty::Val => "(cons X Y)",
+            _ => "(and X Y)",
+        }
+    }
+
+    /// A list of marks (Val) seen through prompts with fresh tags.
+    fn marks_val(&mut self, d: usize) -> E {
+        let tg = self.fresh("tg");
+        let v = self.fresh("v");
+        let k = self.fresh("k");
+        let a = self.expr(Ty::Val, d - 1);
+        let b = self.expr(Ty::Val, d - 1);
+        let tpl = match self.rng.below(5) {
+            0 => format!("(let ([{tg} (make-continuation-prompt-tag)]) (with-continuation-mark 'key $0 (call-with-continuation-prompt (lambda () (with-continuation-mark 'key $1 (continuation-mark-set->list (current-continuation-marks {tg}) 'key))) {tg})))"),
+            1 => format!("(let ([{tg} (make-continuation-prompt-tag)]) (with-continuation-mark 'key $0 (call-with-continuation-prompt (lambda () (list (continuation-mark-set-first #f 'key 'none {tg}) (with-continuation-mark 'key $1 (call-with-immediate-continuation-mark 'key (lambda ({v}) {v}) 'none)))) {tg})))"),
+            2 => format!("(with-continuation-mark 'key $0 (list (call-with-immediate-continuation-mark 'key (lambda ({v}) {v}) 'none) (with-continuation-mark 'key $1 (continuation-mark-set->list (current-continuation-marks) 'key))))"),
+            3 => format!("(let ([{tg} (make-continuation-prompt-tag)]) (call-with-continuation-prompt (lambda () ((let ([{k} (call-with-continuation-prompt (lambda () (with-continuation-mark 'key $0 (car (list (begin ((call-with-composable-continuation (lambda ({k}x) (lambda () (abort-current-continuation {tg} (lambda () {k}x)))) {tg})) (list $1 (continuation-mark-set->list (current-continuation-marks {tg}) 'key))))))) {tg} (lambda ({v}) ({v})))]) (lambda () ({k} void))))) {tg}))"),
+            _ => format!("(let ([{tg} (make-continuation-prompt-tag)]) (with-continuation-mark 'key $0 (call-with-continuation-prompt (lambda () (car (list (with-continuation-mark 'key $1 (call-with-continuation-prompt (lambda () (continuation-mark-set->list (current-continuation-marks {tg}) 'key)))))) {tg}))))"),
+        };
+        E::node(Ty::Val, "marks-tag", &tpl, vec![a, b])
+    }
+
+    /// Delimited control: prompts with fresh or default tags, aborts
+    /// (through dynamic-wind), composable continuations applied more than
+    /// once, full continuations re-entered a bounded number of times,
+    /// continuation marks seen through prompts (rumble control.ss).
+    fn delim(&mut self, ty: Ty, d: usize) -> E {
+        // generic `+` on flonums half the time (fl+ is the unboxed path)
+        let c = if ty == Ty::Fl && self.rng.chance(0.5) { "(+ X Y)" } else { Self::comb(ty) };
+        let tg = self.fresh("tg");
+        let th = self.fresh("th");
+        let k = self.fresh("k");
+        let kk = self.fresh("kk");
+        let r = self.fresh("r");
+        let n = self.fresh("n");
+        let wind = self.rng.chance(0.3);
+        let dw = |e: &str| if wind { format!("(dynamic-wind (lambda () (tap 'in 0)) (lambda () {e}) (lambda () (tap 'out 0)))") } else { e.to_string() };
+        match self.rng.below(5) {
+            0 => {
+                let a = self.expr(ty, d - 1);
+                let cnd = self.expr(Ty::Bool, d - 1);
+                let b = self.expr(ty, d - 1);
+                let e = self.expr(ty, d - 1);
+                let inner = dw("(if $1 (abort-current-continuation TAG (lambda () $2)) $3)");
+                let body = c.replace("X", "$0").replace("Y", &inner);
+                let tpl = if self.rng.chance(0.5) {
+                    format!("(let ([{tg} (make-continuation-prompt-tag)]) (call-with-continuation-prompt (lambda () {}) {tg} (lambda ({th}) ({th}))))", body.replace("TAG", &tg))
+                } else {
+                    format!("(call-with-continuation-prompt (lambda () {}))", body.replace("TAG", "(default-continuation-prompt-tag)"))
+                };
+                E::node(ty, "prompt", &tpl, vec![a, cnd, b, e])
+            }
+            1 => {
+                let a = self.expr(ty, d - 1);
+                let b = self.expr(ty, d - 1);
+                let e = self.expr(ty, d - 1);
+                let cap = dw(&format!("(call-with-composable-continuation (lambda ({k}) (set! {kk} {k}) $1) {tg})"));
+                let mut body = c.replace("X", "$0").replace("Y", &cap);
+                if self.rng.chance(0.4) {
+                    body = format!("(with-continuation-mark 'key 1 {body})");
+                }
+                let again = c.replace("X", &r).replace("Y", &format!("({kk} ({kk} $2))"));
+                let tpl = format!("(let ([{kk} #f] [{tg} (make-continuation-prompt-tag)]) (let ([{r} (call-with-continuation-prompt (lambda () {body}) {tg})]) {again}))");
+                E::node(ty, "composable", &tpl, vec![a, b, e])
+            }
+            2 => {
+                let a = self.expr(ty, d - 1);
+                let b = self.expr(ty, d - 1);
+                let e = self.expr(ty, d - 1);
+                let cap = dw(&format!("(call/cc (lambda ({k}) (set! {kk} {k}) $1))"));
+                let body = c.replace("X", "$0").replace("Y", &cap);
+                let lim = 2 + self.rng.below(3);
+                let tpl = format!("(let ([{n} 0] [{kk} #f]) (let ([{r} {body}]) (set! {n} (fx+ {n} 1)) (if (fx< {n} {lim}) ({kk} $2) {r})))");
+                E::node(ty, "reentry", &tpl, vec![a, b, e])
+            }
+            _ => {
+                let m = self.marks_val(d);
+                match ty {
+                    Ty::Val => m,
+                    Ty::Int => E::node(ty, "", "(length $0)", vec![m]),
+                    Ty::Fl => E::node(ty, "", "(fx->fl (length $0))", vec![m]),
+                    _ => E::node(ty, "", "(pair? $0)", vec![m]),
+                }
             }
         }
     }
@@ -1097,7 +1190,7 @@ pub fn program_metrics(p: &Program, _size: usize) -> Vec<(&'static str, f64)> {
         ("loops", tags.iter().filter(|t| t.contains("loop") || t.starts_with("for")).count() as f64),
         ("if", tags.iter().filter(|t| **t == "if").count() as f64),
         ("fl", tags.iter().filter(|t| t.starts_with("fl")).count() as f64),
-        ("control", tags.iter().filter(|t| ["escape", "wcm", "dynamic-wind", "parameterize", "handlers"].contains(t)).count() as f64),
+        ("control", tags.iter().filter(|t| ["escape", "wcm", "dynamic-wind", "parameterize", "handlers", "prompt", "composable", "reentry", "marks-tag"].contains(t)).count() as f64),
     ]
 }
 

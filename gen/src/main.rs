@@ -119,7 +119,8 @@ struct Pair {
 /// `jitify` is not a runner.rkt variant: it runs on server `d` (env
 /// PLT_CS_COMPILE_LIMIT=10) with variant `none`.
 const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
-                            "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub"];
+                            "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub",
+                            "opaque", "opaquesplit"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -128,7 +129,9 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "split", "splitzo", "splitmi", "split", "splitzo", "splitmi",
                                 "split", "splitzo", "splitmi",
                                 "macro", "macrozo", "macrosplit", "macrosub", "macro", "macrozo", "macrosplit",
-                                "macrosub", "macro", "macrozo", "macrosplit", "macrosub"];
+                                "macrosub", "macro", "macrozo", "macrosplit", "macrosub",
+                                "opaque", "opaque", "opaque", "opaque", "opaque", "opaque", "opaque",
+                                "opaque", "opaquesplit", "opaquesplit", "opaquesplit", "opaquesplit"];
 
 /// `#:unsafe` is only specified when the safe run raises no exn:fail:contract
 /// (syntax.scrbl).  Conservative: the safe machine-code run finished `ok`
@@ -360,7 +363,7 @@ fn classify_all(a: &Res, b: &Res, c: &Option<Res>, variant: &'static str) -> Ver
 }
 
 const PRIORITY: &[&str] = &[
-    "escape", "dynamic-wind", "wcm", "parameterize", "handlers", "closure-set", "unused-fn",
+    "composable", "reentry", "marks-tag", "prompt", "escape", "dynamic-wind", "wcm", "parameterize", "handlers", "closure-set", "unused-fn",
     "letrec-loop", "fl-loop", "for-fold", "for-sum", "values", "struct-mutate", "struct",
     "vector-mutate", "vector", "flvector", "hash", "type-dispatch", "type-guard", "pair-guard",
     "case-any", "box", "vector-any", "list-op", "if-mixed", "char", "symbol", "type-pred", "equal", "pair", "flbit-field", "flround", "flmin-max", "fl->int",

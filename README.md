@@ -35,6 +35,18 @@ literal pools with edge values (0, -1, fixnum bounds, 2^62, -0.0, +-inf.0, +nan.
 values, all shrink candidates and mutants satisfy `valid_program` (every free name defined earlier).
 Median program 103 nodes / 1.2 KB, median 2 loops, 4 ifs, 3 control forms.
 
+### Delimited control (steering round 5)
+
+`Gen::delim` (4% of control choices, taken from `if`): `call-with-continuation-prompt` with fresh
+tags (explicit handler) or the default tag (default handler), `abort-current-continuation` to them,
+optionally through `dynamic-wind` (printing `in`/`out`); composable continuations captured inside a
+prompt (optionally under a mark) and applied twice after the prompt returned; full continuations
+(`call/cc`) re-entered 1-3 more times through a `set!`-ed local; marks seen through prompts:
+`continuation-mark-set->list`/`-first` with a prompt tag, `call-with-immediate-continuation-mark`,
+and the shape of issue #5658 (a composable continuation captured under a mark, aborted out of and
+re-applied in a new prompt). Area tags `composable`, `reentry`, `marks-tag`, `prompt` (first in
+PRIORITY).
+
 ### Dynamic kind (`Val`, steering round 3)
 
 Besides the typed int/flonum/boolean expressions, a dynamically typed kind `Val` mixes fixnums,
@@ -132,6 +144,21 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (`local-expand` of the argument to core forms, or with a stop list, then re-expanded).
      `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten
      module(s). They get a third of the drawn cases.
+   - `opaque`, `opaquesplit` (metamorphic, steering round 5; runner.rkt `opaque-module`): selected
+     sites are wrapped in `(opq-v e)`, `opq-v` a module variable holding the identity that is
+     `set!` once, so schemify and Chez cp0/cptypes cannot see through it: literals stop being
+     constants, variable references lose known values/types, `(f a ...)` becomes `((opq-v f) a ...)`
+     (no inlining or known call; for a primitive the out-of-line library procedure instead of the
+     inline cpprim code), `if`/`cond`/`case` tests cannot be folded. Only single-valued, non-tail
+     positions are wrapped (arguments, tests, non-lambda right-hand sides) and callees keep tail
+     position, so marks and tail calls are unchanged. Densities per program (deterministic in the
+     text). `opaquesplit` splits the rewritten module (in-memory).
+   - `ctlnoise`, `ctlsplit`: the same sites wrapped in control forms that are the identity — a
+     prompt with a tag only the wrappers use, an abort to such a prompt whose handler evaluates the
+     expression, `dynamic-wind` with `void` thunks, application of an empty composable continuation
+     (rumble control.ss metacontinuation frames, mark splices, winders). `ctlsplit` = split + zo.
+     `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten module(s) for all four.
+     The opaque/ctl variants get about a third of the drawn cases.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 
