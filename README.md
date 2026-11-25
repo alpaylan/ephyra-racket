@@ -202,7 +202,10 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      crashes/hangs/internal errors (9.3's problems), programs using names 9.3 lacks
      (`NEW_SINCE_93`, e.g. `flhypot`; also any 9.3 unbound-identifier/syntax error), and
      differing programs that capture continuations (9.3 has the unboxed-flonum continuation
-     bug fixed by patch 003). Kinds: `ref93__value__*`, `ref93__error__*`. **Triage every
+     bug fixed by patch 003), and known 9.3 bugs repaired in trunk that the generator hits
+     (`skip_ref93_known_*`: programs with an unused local function, 8f67966b14; a 9.3-only
+     "cannot modify a constant", schemify mutation tracking 0cd7dd3cc0/bc1b6eb434 — generated
+     programs never set! a constant; `expt` with -2^60, 45177e8405). Kinds: `ref93__value__*`, `ref93__error__*`. **Triage every
      ref93 finding against `git log v9.3..HEAD`** (regexp repairs, expt with
      most-negative-fixnum, log1+/atanh accuracy, Unicode 18, struct field limit, reader `#s`)
      before calling it a regression; also check whether trunk or 9.3 is the one that is wrong.
