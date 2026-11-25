@@ -1262,7 +1262,12 @@ impl<'a> Gen<'a> {
             0 | 1 => { let e = self.expr(Ty::Int, d - 1); E::node(Ty::Val, "", "$0", vec![e]) }
             2 | 3 => { let e = self.expr(Ty::Fl, d - 1); E::node(Ty::Val, "", "$0", vec![e]) }
             4 | 5 | 6 => self.lib_lit(NUM_POOL),
-            _ => self.lib_numop(d - 1),
+            _ => {
+                // lib_numop may give a boolean, list or string: keep numbers
+                let e = self.lib_numop(d - 1);
+                let t = self.fresh("t");
+                E::node(Ty::Val, "", &format!("(let ([{t} $0]) (if (number? {t}) {t} 7))"), vec![e])
+            }
         }
     }
     fn lib_int(&mut self, d: usize) -> E {
@@ -1278,7 +1283,10 @@ impl<'a> Gen<'a> {
         if d == 0 || self.rng.chance(0.5) {
             return self.lib_lit(STR_POOL);
         }
-        self.lib_strop(d - 1)
+        // lib_strop may give any value: non-strings are printed
+        let e = self.lib_strop(d - 1);
+        let t = self.fresh("t");
+        E::node(Ty::Val, "", &format!("(let ([{t} $0]) (if (string? {t}) {t} (format \"~s\" {t})))"), vec![e])
     }
     fn lib_char(&mut self, d: usize) -> E {
         if d == 0 || self.rng.chance(0.6) {
@@ -1360,7 +1368,7 @@ impl<'a> Gen<'a> {
             15 | 16 => { let rx = self.lib_lit(RX_POOL); let s = self.lib_str(d); let op = *self.rng.pick(&["(regexp-match $0 $1)", "(regexp-match-positions $0 $1)", "(regexp-match* $0 $1)", "(regexp-split $0 $1)", "(regexp-replace $0 $1 \"<\\\\0>\")", "(regexp-replace* $0 $1 \"_\")", "(regexp-match? $0 $1)", "(regexp-match-positions* $0 $1)"]); E::node(Ty::Val, "lib-regexp", op, vec![rx, s]) }
             17 => { let v = self.lib_any(d); let op = *self.rng.pick(&["write", "display", "print"]); E::node(Ty::Val, "lib-print", &format!("(let ([o (open-output-string)]) ({op} $0 o) (get-output-string o))"), vec![v]) }
             18 => { let a = self.lib_any(d); let b = self.lib_any(d); let f = *self.rng.pick(&["\"~a|~s\"", "\"~v ~e\"", "\"~s~n~a\"", "\"~.3a/~s\""]); E::node(Ty::Val, "lib-print", &format!("(format {f} $0 $1)"), vec![a, b]) }
-            19 => { let v = self.lib_any(d); E::node(Ty::Val, "lib-print", &format!("(let ([{t} $0]) (let ([r (read (open-input-string (format \"~s\" {t})))]) (list r (equal? r {t}))))"), vec![v]) }
+            19 => { let v = self.lib_any(d); E::node(Ty::Val, "lib-print", &format!("(let ([{t} $0]) (with-handlers ([exn:fail:read? (lambda (e) 'unreadable)]) (let ([r (read (open-input-string (format \"~s\" {t})))]) (list r (equal? r {t})))))"), vec![v]) }
             20 => { let s = self.lib_str(d); E::node(Ty::Val, "lib-print", &format!("(with-handlers ([exn:fail:read? (lambda (e) 'read-error)]) (let ([p (open-input-string $0)]) (let loop ([n 0] [acc '()]) (let ([{t} (read p)]) (if (or (eof-object? {t}) (fx> n 4)) (reverse acc) (loop (fx+ n 1) (cons {t} acc)))))))"), vec![s]) }
             _ => { let n = self.lib_num(d); E::node(Ty::Val, "lib-string", "(string-length (number->string $0))", vec![n]) }
         }
