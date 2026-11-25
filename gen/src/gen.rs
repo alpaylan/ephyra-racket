@@ -255,7 +255,14 @@ impl<'a> Gen<'a> {
                     3 => {
                         let s = self.rng.below(60);
                         let e = s + 1 + self.rng.below(64 - s);
-                        E::node(Ty::Int, "flbit-field", &format!("(flbit-field $0 {s} {e})"), vec![f])
+                        // NaN bit patterns are not part of Racket's contract: "The datum
+                        // -nan.0 refers to the same constant as +nan.0" (reference,
+                        // numbers.scrbl:74) and all NaNs are eqv?. Compiled `max`/`min`
+                        // become the branchless flmax/flmin (Chez 7c76ed9456), whose NaN
+                        // result is all-ones by design, while the interpreter's generic
+                        // max returns the canonical +nan.0; flbit-field would expose that
+                        // difference. Canonicalise NaN only right before flbit-field.
+                        E::node(Ty::Int, "flbit-field", &format!("(flbit-field (let ([fbx $0]) (if (= fbx fbx) fbx +nan.0)) {s} {e})"), vec![f])
                     }
                     _ => E::node(Ty::Int, "fl->int", "(exact-truncate* $0)", vec![f]),
                 }
