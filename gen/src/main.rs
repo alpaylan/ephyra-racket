@@ -94,17 +94,39 @@ struct Pair {
     runner: PathBuf,
     a: Server,
     b: Server,
+    /// machine code, compiled under the case's optimizer variant
+    c: Server,
     restarts: u64,
+}
+
+/// Optimizer variants run on server `c` (runner.rkt VARIANTS); each case
+/// gets one, kept fixed while that case is shrunk.  The variant name is the
+/// oracle name of its signatures.
+const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big"];
+
+/// `#:unsafe` is only specified when the safe run raises no exn:fail:contract
+/// (syntax.scrbl).  Conservative: the safe machine-code run finished `ok`
+/// and no exception was raised and caught anywhere (`show` prints `(exn ...`,
+/// the generated `with-handlers` handler prints `caught `).
+fn unsafe_eligible(a: &Res) -> bool {
+    match a {
+        Res::Line(l) => kind_of(l) == "ok" && !l.contains("(exn ") && !l.contains("caught "),
+        _ => false,
+    }
 }
 
 impl Pair {
     fn new(racket: PathBuf, runner: PathBuf) -> Pair {
         let a = spawn_server(&racket, &runner, false);
         let b = spawn_server(&racket, &runner, true);
-        Pair { racket, runner, a, b, restarts: 0 }
+        let c = spawn_server(&racket, &runner, false);
+        Pair { racket, runner, a, b, c, restarts: 0 }
     }
     fn send(s: &mut Server, prog: &str) -> bool {
-        let msg = format!("{}\n{}", prog.len(), prog);
+        Self::send_v(s, prog, "none")
+    }
+    fn send_v(s: &mut Server, prog: &str, variant: &str) -> bool {
+        let msg = format!("{} {}\n{}", prog.len(), variant, prog);
         s.stdin.write_all(msg.as_bytes()).and_then(|_| s.stdin.flush()).is_ok()
     }
     fn recv(s: &mut Server, sent: bool, limit: Duration) -> Res {
@@ -123,12 +145,30 @@ impl Pair {
         let e = s.stderr.lock().unwrap().clone();
         format!("status {st}; stderr: {}", e.chars().rev().take(1500).collect::<String>().chars().rev().collect::<String>())
     }
-    fn query(&mut self, prog: &str) -> (Res, Res) {
+    fn query(&mut self, prog: &str, variant: &str) -> (Res, Res, Option<Res>) {
         let lim = Duration::from_secs(CASE_TIMEOUT_S + 30);
-        // Send to both first so they run in parallel.
+        // Send to a and b first so they run in parallel; c (variant) too,
+        // except `unsafe`: it runs after a, only when a's run makes it eligible (an
+        // ineligible unsafe run is undefined behaviour and could corrupt the
+        // server).  b (interpreter) is the slow one anyway.
         let sa = Self::send(&mut self.a, prog);
         let sb = Self::send(&mut self.b, prog);
+        // safe variants run in parallel with a
+        let sc_early = if variant != "unsafe" { Some(Self::send_v(&mut self.c, prog, variant)) } else { None };
         let ra = Self::recv(&mut self.a, sa, lim);
+        let rc = if variant != "unsafe" || unsafe_eligible(&ra) {
+            let sc = match sc_early { Some(x) => x, None => Self::send_v(&mut self.c, prog, variant) };
+            let rc = Self::recv(&mut self.c, sc, lim);
+            if !matches!(rc, Res::Line(_)) {
+                let _ = self.c.child.kill();
+                let _ = self.c.child.wait();
+                self.c = spawn_server(&self.racket, &self.runner, false);
+                self.restarts += 1;
+            }
+            Some(rc)
+        } else {
+            None
+        };
         let rb = Self::recv(&mut self.b, sb, lim);
         if !matches!(ra, Res::Line(_)) {
             let _ = self.a.child.kill();
@@ -142,12 +182,13 @@ impl Pair {
             self.b = spawn_server(&self.racket, &self.runner, true);
             self.restarts += 1;
         }
-        (ra, rb)
+        (ra, rb, rc)
     }
     fn close(mut self) {
         drop(self.a.stdin);
         drop(self.b.stdin);
-        for c in [&mut self.a.child, &mut self.b.child] {
+        drop(self.c.stdin);
+        for c in [&mut self.a.child, &mut self.b.child, &mut self.c.child] {
             let t = Instant::now();
             loop {
                 if let Ok(Some(_)) = c.try_wait() {
@@ -226,6 +267,61 @@ fn classify(a: &Res, b: &Res) -> Verdict {
         return Verdict::Fail("diff", "errmsg");
     }
     Verdict::Fail("diff", "value")
+}
+
+/// Variant oracle: machine code (a) vs machine code under an optimizer
+/// toggle (c).  Toggles must not change results (compiler.scrbl /
+/// eval.scrbl: context preservation only affects stack traces; unsafe only
+/// where exn:fail:contract would be raised, excluded by eligibility).
+fn classify_variant(a: &Res, c: &Option<Res>, variant: &'static str) -> Verdict {
+    let Some(c) = c else { return Verdict::Pass };
+    let la = match a {
+        Res::Line(l) if kind_of(l) != "timeout" && kind_of(l) != "oom" => l,
+        _ => return Verdict::Pass,
+    };
+    let lc = match c {
+        Res::Died(_) => return Verdict::Fail(variant, "died"),
+        Res::Hung => return Verdict::Fail(variant, "hang"),
+        Res::Line(l) => l,
+    };
+    if INTERNAL.iter().any(|p| lc.contains(p)) && !INTERNAL.iter().any(|p| la.contains(p)) {
+        return Verdict::Fail(variant, "internal");
+    }
+    let kc = kind_of(lc);
+    if kc == "oom" {
+        return Verdict::Skip("variant_oom");
+    }
+    if kc == "timeout" {
+        return Verdict::Fail(variant, "hang");
+    }
+    if la == lc {
+        return Verdict::Pass;
+    }
+    let fa: Vec<&str> = la.split('\t').collect();
+    let fc: Vec<&str> = lc.split('\t').collect();
+    if kind_of(la) != kc {
+        return Verdict::Fail(variant, "error");
+    }
+    if kc == "exn" && fa.get(1) == fc.get(1) {
+        if fa.get(2) != fc.get(2) {
+            return Verdict::Fail(variant, "error");
+        }
+        return Verdict::Fail(variant, "errmsg");
+    }
+    Verdict::Fail(variant, "value")
+}
+
+/// Both oracles; machine-vs-interpreter first (its signatures unchanged).
+fn classify_all(a: &Res, b: &Res, c: &Option<Res>, variant: &'static str) -> Verdict {
+    let v1 = classify(a, b);
+    if matches!(v1, Verdict::Fail(..)) {
+        return v1;
+    }
+    match classify_variant(a, c, variant) {
+        Verdict::Pass => v1,
+        v2 @ Verdict::Fail(..) => v2,
+        Verdict::Skip(r) => if v1 == Verdict::Pass { Verdict::Skip(r) } else { v1 },
+    }
 }
 
 const PRIORITY: &[&str] = &[
@@ -315,6 +411,52 @@ case $KIND in
 esac
 "#;
 
+const REPRO_VARIANT: &str = r#"#!/usr/bin/env bash
+# Repro for signature @SIG@ (oracle @ORACLE@, kind @KIND@).
+# Runs prog.rkt through runner.rkt twice with the build's racket, both
+# compiled to machine code: default, and with optimizer variant @ORACLE@
+# (runner.rkt VARIANTS).  For `unsafe` the default run must be eligible (ok,
+# no exception raised and caught), else the case is not comparable.
+# exit 1: failure reproduces; 0: it does not; 2: cannot decide.
+B=$(cd "$1" 2>/dev/null && pwd) || exit 2
+R="$B/src/racket/bin/racket"
+[ -x "$R" ] || exit 2
+cd "$(dirname "$0")"
+KIND=@KIND@
+VAR=@ORACLE@
+a=$(env -u PLT_CS_INTERP RKT_CASE_TIMEOUT=20 timeout -k 5 120 "$R" runner.rkt file prog.rkt none 2>&1); ca=$?
+res() { printf '%s
+' "$1" | grep -E $'^(ok|exn|raise|timeout|oom)	|^oom$' | tail -1; }
+ra=$(res "$a")
+[ -z "$ra" ] && exit 2
+case "$ra" in timeout*|oom*) exit 2;; esac
+if [ "$VAR" = unsafe ]; then
+  case "$ra" in ok*) ;; *) exit 0;; esac
+  case "$ra" in *"(exn "*|*"caught "*) exit 0;; esac
+fi
+c=$(env -u PLT_CS_INTERP RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
+rc=$(res "$c")
+case $KIND in
+  died)
+    if [ "$cc" != 0 ] && [ "$cc" != 124 ] && [ "$cc" != 137 ] && [ -z "$rc" ]; then exit 1; fi
+    exit 0 ;;
+  internal)
+    if printf '%s
+' "$c" | grep -qE 'internal error|invalid memory reference|Exception in |attempt to reference unbound|compile-time'; then exit 1; fi
+    [ -n "$rc" ] && exit 0
+    exit 2 ;;
+  hang)
+    case "$rc" in timeout*) exit 1;; esac
+    [ -z "$rc" ] && exit 2
+    exit 0 ;;
+  *)
+    [ -z "$rc" ] && exit 2
+    case "$rc" in *oom*|timeout*) exit 2;; esac
+    [ "$ra" != "$rc" ] && exit 1
+    exit 0 ;;
+esac
+"#;
+
 struct Search {
     out: PathBuf,
     runner_src: PathBuf,
@@ -324,7 +466,7 @@ struct Search {
 
 impl Search {
     /// Write a finding for the (already shrunk) program; `ra`/`rb` are its results.
-    fn record(&mut self, small: &Program, v: &Verdict, seed_label: &str, ra: &Res, rb: &Res) {
+    fn record(&mut self, small: &Program, v: &Verdict, seed_label: &str, ra: &Res, rb: &Res, rc: &Option<Res>) {
         let (oracle, kind) = match v {
             Verdict::Fail(o, k) => (*o, *k),
             _ => return,
@@ -341,7 +483,13 @@ impl Search {
         let prog = render_program(small);
         std::fs::write(dir.join("prog.rkt"), &prog).unwrap();
         std::fs::copy(&self.runner_src, dir.join("runner.rkt")).unwrap();
-        let msg = format!("machine-code: {}\ninterpreter:  {}", res_text(ra), res_text(rb));
+        let is_variant = VARIANTS.contains(&oracle);
+        let msg = if is_variant {
+            let c = rc.as_ref().map(res_text).unwrap_or_else(|| "(not run)".into());
+            format!("machine-code: {}\nmachine-code, variant {oracle}: {}", res_text(ra), c)
+        } else {
+            format!("machine-code: {}\ninterpreter:  {}", res_text(ra), res_text(rb))
+        };
         std::fs::write(dir.join("results.txt"), &msg).unwrap();
         let fj = format!(
             "{{\"signature\": {}, \"oracle\": {}, \"message\": {}, \"seed\": {}}}\n",
@@ -351,7 +499,7 @@ impl Search {
             json_str(seed_label)
         );
         std::fs::write(dir.join("finding.json"), fj).unwrap();
-        let rs = REPRO.replace("@SIG@", &sig).replace("@ORACLE@", oracle).replace("@KIND@", kind);
+        let rs = (if is_variant { REPRO_VARIANT } else { REPRO }).replace("@SIG@", &sig).replace("@ORACLE@", oracle).replace("@KIND@", kind);
         let rp = dir.join("repro.sh");
         std::fs::write(&rp, rs).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -376,6 +524,14 @@ fn fail_at(v: &Verdict, detail: &str) {
         Verdict::Fail("crash", "died") => panic!("crash died: {detail}"),
         Verdict::Fail("crash", "internal") => panic!("crash internal: {detail}"),
         Verdict::Fail("crash", "hang") => panic!("crash hang: {detail}"),
+        // variant oracles: the variant is fixed while a case is shrunk, so
+        // one site per kind keeps the failure kind.
+        Verdict::Fail(_, "value") => panic!("variant value: {detail}"),
+        Verdict::Fail(_, "error") => panic!("variant error: {detail}"),
+        Verdict::Fail(_, "errmsg") => panic!("variant errmsg: {detail}"),
+        Verdict::Fail(_, "died") => panic!("variant died: {detail}"),
+        Verdict::Fail(_, "internal") => panic!("variant internal: {detail}"),
+        Verdict::Fail(_, "hang") => panic!("variant hang: {detail}"),
         Verdict::Fail(o, k) => panic!("{o} {k}: {detail}"),
         _ => {}
     }
@@ -386,6 +542,7 @@ struct Last {
     verdict: Verdict,
     a: Res,
     b: Res,
+    c: Option<Res>,
 }
 
 fn write_stats(out: &Path, cases: u64, failures: u64, extra: &BTreeMap<String, u64>, rate: f64) {
@@ -423,16 +580,19 @@ fn main() {
             let deadline = t0 + Duration::from_secs(secs);
             let pair = RefCell::new(Pair::new(racket, runner.clone()));
             let last: RefCell<Option<Last>> = RefCell::new(None);
+            let variant: std::cell::Cell<&'static str> = std::cell::Cell::new(VARIANTS[0]);
             let mut search = Search { out: out.clone(), runner_src: runner, per_sig: HashMap::new(), shrinks_per_kind: HashMap::new() };
             let mut extra: BTreeMap<String, u64> = BTreeMap::new();
             let (mut cases, mut failures) = (0u64, 0u64);
             let mut last_write = Instant::now();
             write_stats(&out, 0, 0, &extra, 0.0);
             let property = |p: Program| -> TestResult {
-                let (a, b) = pair.borrow_mut().query(&render_program(&p.0));
-                let v = classify(&a, &b);
-                let detail = format!("machine={} interp={}", res_text(&a), res_text(&b));
-                *last.borrow_mut() = Some(Last { verdict: v.clone(), a, b });
+                let var = variant.get();
+                let (a, b, c) = pair.borrow_mut().query(&render_program(&p.0), var);
+                let v = classify_all(&a, &b, &c, var);
+                let detail = format!("machine={} interp={} variant {var}={}", res_text(&a), res_text(&b),
+                                     c.as_ref().map(res_text).unwrap_or_default());
+                *last.borrow_mut() = Some(Last { verdict: v.clone(), a, b, c });
                 match &v {
                     Verdict::Pass => TestResult::check(true, ""),
                     // timeouts/oom: not comparable (documented in README)
@@ -461,14 +621,22 @@ fn main() {
                 let seg_seed = cfg.seed.unwrap();
                 segment += 1;
                 let mut run = Run::new(&cfg, ProgramGen, &property);
-                let mut failed: Option<(Program, Verdict, Res, Res, u64)> = None;
+                let mut failed: Option<(Program, Verdict, Res, Res, Option<Res>, u64)> = None;
                 while run.wants_more() && Instant::now() < deadline {
                     let Some(input) = run.draw() else { continue };
                     let iter = input.iteration();
+                    // one variant per drawn case; unchanged while it is shrunk
+                    variant.set(VARIANTS[(mix(seed, 7_000_000 + cases) % VARIANTS.len() as u64) as usize]);
                     let tested = run.test(&input);
                     cases += 1;
                     let l = last.borrow_mut().take();
-                    if let Some(Last { verdict, a, b }) = l {
+                    if let Some(Last { verdict, a, b, c }) = l {
+                        let var = variant.get();
+                        match &c {
+                            Some(_) => *extra.entry(format!("variant_cmp_{var}")).or_insert(0) += 1,
+                            None if var == "unsafe" => *extra.entry("unsafe_ineligible".into()).or_insert(0) += 1,
+                            None => {}
+                        }
                         if let Res::Line(l) = &a {
                             *extra.entry(format!("result_{}", kind_of(l))).or_insert(0) += 1;
                             if l.contains("exn:fail:syntax") || l.contains("exn:fail:read") {
@@ -487,7 +655,7 @@ fn main() {
                         }
                         if tested.failed() {
                             failures += 1;
-                            failed = Some((input.value.clone(), verdict, a, b, iter));
+                            failed = Some((input.value.clone(), verdict, a, b, c, iter));
                             break;
                         }
                     }
@@ -497,7 +665,7 @@ fn main() {
                         write_stats(&out, cases, failures, &extra, cases as f64 / t0.elapsed().as_secs_f64());
                     }
                 }
-                if let Some((orig, v, a, b, iter)) = failed {
+                if let Some((orig, v, a, b, c, iter)) = failed {
                     let key = match &v {
                         Verdict::Fail(o, k) => format!("{o}__{k}"),
                         _ => String::new(),
@@ -513,9 +681,10 @@ fn main() {
                         orig.clone()
                     };
                     if *n <= 40 {
-                        let (ra, rb) = pair.borrow_mut().query(&render_program(&small.0));
-                        let (ra, rb) = if classify(&ra, &rb) == v { (ra, rb) } else { (a, b) };
-                        search.record(&small, &v, &format!("{seg_seed}:{iter}"), &ra, &rb);
+                        let var = variant.get();
+                        let (ra, rb, rc) = pair.borrow_mut().query(&render_program(&small.0), var);
+                        let (ra, rb, rc) = if classify_all(&ra, &rb, &rc, var) == v { (ra, rb, rc) } else { (a, b, c) };
+                        search.record(&small, &v, &format!("{seg_seed}:{iter}"), &ra, &rb, &rc);
                     }
                 }
                 let _ = run.finish();

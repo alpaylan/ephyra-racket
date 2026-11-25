@@ -50,6 +50,25 @@ Median program 103 nodes / 1.2 KB, median 2 loops, 4 ifs, 3 control forms.
    `attempt to reference unbound`, `compile-time`, or the machine-code side times out (10 s) while
    the ~100x slower interpreter finished (a compile hang, cf. issue #5632).
 
+3. **variant** (`<variant>__{value,error,errmsg,died,internal,hang}__<area>`, oracle = variant name):
+   a third server, also machine code, compiles the same module with one optimizer toggle changed
+   and must print the same result line as the default machine-code server. One variant per drawn
+   case (`mix(seed, case)`), kept fixed while that case is shrunk; sent in the frame header
+   (`<nbytes> <variant>`), applied by `runner.rkt` around the compile and restored after:
+   - `unsafe`: `(#%declare #:unsafe)` after the module header (schemify `unsafe?`, Chez
+     optimize-level 3, the unsafe cpprim inlines). syntax.scrbl: behaviour is unspecified only "for
+     an evaluation where exn:fail:contract should have been raised", so the case is compared only
+     when the default run is `ok` with no exception raised and caught anywhere (`show` prints
+     `(exn ...`, the generated `with-handlers` handler now prints `caught ` via `tap`); otherwise it
+     is not even sent (UB could corrupt the server). ~50% of cases are eligible.
+   - `nocp0`: Chez `(run-cp0 (lambda (cp0 x) x))`; `notr`: `(enable-type-recovery #f)`;
+     `cp0big`: `cp0-score-limit` 120, `cp0-effort-limit` 5000, `cp0-outer-unroll-limit` 2.
+   - `ctx`: `compile-context-preservation-enabled #t` (schemify `inline?` #f; eval.scrbl: it only
+     avoids optimizations that lose stack-trace information).
+   - `noconst`: `compile-enforce-module-constants #f` (schemify's known-binding analysis).
+   A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
+   `runner.rkt file prog.rkt none` and `... <variant>` and compares.
+
 `<area>` is the highest-priority construct tag present in the shrunk program (priority list
 `PRIORITY` in main.rs: control forms first, then specific primitives, then generic arithmetic). One
 bug can therefore show up under a few areas when the shrinker cannot remove an incidental construct.

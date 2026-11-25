@@ -592,7 +592,7 @@ impl<'a> Gen<'a> {
             75..=79 => {
                 let a = self.expr(ty, d - 1);
                 let b = self.expr(ty, d - 1);
-                E::node(ty, "handlers", "(with-handlers ([exn:fail? (lambda (e) $1)]) $0)", vec![a, b])
+                E::node(ty, "handlers", "(with-handlers ([exn:fail? (lambda (e) (tap 'caught $1))]) $0)", vec![a, b])
             }
             80..=84 => {
                 // local recursive function with bounded recursion
