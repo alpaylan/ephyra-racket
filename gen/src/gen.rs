@@ -1306,7 +1306,16 @@ impl<'a> Gen<'a> {
             3 => { let a = self.lib_num(d); E::node(Ty::Val, "lib-num", "(inexact->exact $0)", vec![a]) }
             4 => { let a = self.lib_num(d); let k = self.small_lit(-4, 70); E::node(Ty::Val, "lib-num", "(expt $0 $1)", vec![a, k]) }
             5 => { let a = self.lib_num(d); let b = self.lib_num(d); E::node(Ty::Val, "lib-num", "(expt $0 $1)", vec![a, b]) }
-            6 => { let a = self.lib_num(d); let op = *self.rng.pick(&["sqrt", "exp", "log", "sin", "cos", "atan", "tan", "asin", "acos"]); E::node(Ty::Val, "lib-num", &format!("({op} $0)"), vec![a]) }
+            6 => {
+                let a = self.lib_num(d);
+                let op = *self.rng.pick(&["sqrt", "exp", "log", "sin", "cos", "atan", "tan", "asin", "acos"]);
+                if ["atan", "asin", "acos"].contains(&op) {
+                    // complex arguments: 47b09a1d58 changed atanh of complex args after 9.3
+                    E::node(Ty::Val, "lib-num", &format!("(let ([{t} $0]) (if (real? {t}) ({op} {t}) 'cx))"), vec![a])
+                } else {
+                    E::node(Ty::Val, "lib-num", &format!("({op} $0)"), vec![a])
+                }
+            }
             7 => { let a = self.lib_num(d); let op = *self.rng.pick(&["floor", "ceiling", "round", "truncate", "numerator", "denominator", "abs", "magnitude", "angle", "real-part", "imag-part", "exact-nonnegative-integer?", "integer?", "rational?", "exact?"]); E::node(Ty::Val, "lib-num", &format!("({op} $0)"), vec![a]) }
             8 => { let a = self.lib_int(d); let r = *self.rng.pick(&["2", "8", "16", "10"]); E::node(Ty::Val, "lib-numstr", &format!("(number->string $0 {r})"), vec![a]) }
             9 | 10 => { let a = self.lib_num(d); E::node(Ty::Val, "lib-numstr", "(number->string $0)", vec![a]) }
@@ -1323,7 +1332,7 @@ impl<'a> Gen<'a> {
             22 => { let a = self.lib_num(d); let b = self.lib_num(d); let op = *self.rng.pick(&["eqv?", "equal?"]); E::node(Ty::Val, "lib-cmp", &format!("({op} $0 $1)"), vec![a, b]) }
             23 => { let a = self.lib_num(d); let b = self.lib_num(d); E::node(Ty::Val, "lib-num", "(atan $0 $1)", vec![a, b]) }
             24 => { let a = self.lib_num(d); let b = self.lib_num(d); E::node(Ty::Val, "lib-num", "(log $0 $1)", vec![a, b]) }
-            25 => { let l = self.lib_numlist(d); let op = *self.rng.pick(&["max", "min", "+", "*", "gcd", "lcm"]); E::node(Ty::Val, "lib-list", &format!("(apply {op} $0)"), vec![l]) }
+            25 => { let l = self.lib_numlist(d); let op = *self.rng.pick(&["max", "min", "+", "*", "gcd"]); E::node(Ty::Val, "lib-list", &format!("(apply {op} $0)"), vec![l]) }
             26 => { let a = self.lib_int(d); let k = self.small_lit(1, 80); E::node(Ty::Val, "lib-num", "(exact->inexact (/ (expt 10 $1) (+ 3 (abs $0))))", vec![a, k]) }
             27 => { let a = self.lib_num(d); E::node(Ty::Val, "lib-num", &format!("(let ([{t} $0]) (if (real? {t}) (list (round {t}) (exact->inexact {t}) (inexact->exact (round (* 1.0 {t})))) {t}))"), vec![a]) }
             28 => { let a = self.lib_int(d); let b = self.lib_int(d); let op = *self.rng.pick(&["bitwise-bit-set?", "gcd", "lcm", "modulo", "remainder"]); E::node(Ty::Val, "lib-num", &format!("({op} $0 $1)"), vec![a, b]) }

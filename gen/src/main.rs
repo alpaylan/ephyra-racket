@@ -501,6 +501,21 @@ fn classify_ref93(a: &Res, c: &Res, prog: &str) -> Verdict {
     if prog.contains("call-with-composable-continuation") || prog.contains("call/cc") || prog.contains("call-with-current-continuation") {
         return Verdict::Skip("ref93_continuation");
     }
+    // 9.3 bugs repaired in trunk that this generator hits:
+    // 8f67966b14 (schemify unused-function handling: a module variable
+    // set! next to an unused local function counted as constant), and the
+    // schemify mutation-tracking repairs (0cd7dd3cc0, bc1b6eb434): generated
+    // programs only set! variables they mutate, so "cannot modify a constant"
+    // is never right; 45177e8405 (expt with a most-negative-fixnum exponent).
+    if prog.contains("(define (unused") {
+        return Verdict::Skip("ref93_known_unused_fn");
+    }
+    if lc.contains("cannot modify a constant") && !la.contains("cannot modify a constant") {
+        return Verdict::Skip("ref93_known_mutation");
+    }
+    if prog.contains("expt") && prog.contains("-1152921504606846976") {
+        return Verdict::Skip("ref93_known_expt");
+    }
     if kind_of(la) != kind_of(lc) || (kind_of(la) == "exn" && na.split('\t').nth(2) != nc.split('\t').nth(2)) {
         return Verdict::Fail("ref93", "error");
     }
@@ -687,6 +702,7 @@ ra=$(res "$a"); rb=$(res "$b"); rc=$(res "$c")
 case "$ra$rb$rc" in *timeout*|*oom*) exit 2;; esac
 [ "$ra" != "$rb" ] && exit 0
 case "$rc" in *"unbound identifier"*|*exn:fail:syntax*) exit 2;; esac
+case "$rc" in *"cannot modify a constant"*) case "$ra" in *"cannot modify a constant"*) ;; *) exit 0;; esac;; esac
 RA="$ra" RC="$rc" python3 -I -c '
 import os, sys
 prog = open("prog.rkt", encoding="utf-8").read()
