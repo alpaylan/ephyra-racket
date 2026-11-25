@@ -70,6 +70,9 @@ Median program 103 nodes / 1.2 KB, median 2 loops, 4 ifs, 3 control forms.
      `eval` — the `raco make` path (serializable schemify, literal lifting, fasl of machine code).
    - `machind`: same with `current-compile-target-machine #f`, then
      `compiled-expression-recompile` (machine-independent form recompiled through schemify).
+   - `jitify`: a fourth server (started on first use) with `PLT_CS_COMPILE_LIMIT=10`, so every
+     module is a "large linklet": schemify's jitify mode (schemify/jitify.rkt), only interior
+     functions compiled, the outer body interpreted — the path real modules over 10 000 terms take.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

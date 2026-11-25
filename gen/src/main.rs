@@ -40,6 +40,13 @@ struct Server {
 }
 
 fn spawn_server(racket: &Path, runner: &Path, interp: bool) -> Server {
+    spawn_server_jit(racket, runner, interp, false)
+}
+
+/// `jitify`: PLT_CS_COMPILE_LIMIT=10, so every module counts as a "large
+/// linklet": schemify's jitify mode, only interior functions compiled to
+/// machine code, the outer body interpreted (linklet.sls).
+fn spawn_server_jit(racket: &Path, runner: &Path, interp: bool, jitify: bool) -> Server {
     let mut cmd = Command::new(racket);
     cmd.arg(runner).arg("server");
     cmd.env("RKT_CASE_TIMEOUT", CASE_TIMEOUT_S.to_string());
@@ -47,6 +54,11 @@ fn spawn_server(racket: &Path, runner: &Path, interp: bool) -> Server {
         cmd.env("PLT_CS_INTERP", "1");
     } else {
         cmd.env_remove("PLT_CS_INTERP");
+    }
+    if jitify {
+        cmd.env("PLT_CS_COMPILE_LIMIT", "10");
+    } else {
+        cmd.env_remove("PLT_CS_COMPILE_LIMIT");
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn racket");
@@ -96,13 +108,17 @@ struct Pair {
     b: Server,
     /// machine code, compiled under the case's optimizer variant
     c: Server,
+    /// machine code in jitify mode (variant `jitify`), started on first use
+    d: Option<Server>,
     restarts: u64,
 }
 
 /// Optimizer variants run on server `c` (runner.rkt VARIANTS); each case
 /// gets one, kept fixed while that case is shrunk.  The variant name is the
 /// oracle name of its signatures.
-const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind"];
+/// `jitify` is not a runner.rkt variant: it runs on server `d` (env
+/// PLT_CS_COMPILE_LIMIT=10) with variant `none`.
+const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify"];
 
 /// `#:unsafe` is only specified when the safe run raises no exn:fail:contract
 /// (syntax.scrbl).  Conservative: the safe machine-code run finished `ok`
@@ -120,7 +136,7 @@ impl Pair {
         let a = spawn_server(&racket, &runner, false);
         let b = spawn_server(&racket, &runner, true);
         let c = spawn_server(&racket, &runner, false);
-        Pair { racket, runner, a, b, c, restarts: 0 }
+        Pair { racket, runner, a, b, c, d: None, restarts: 0 }
     }
     fn send(s: &mut Server, prog: &str) -> bool {
         Self::send_v(s, prog, "none")
@@ -154,15 +170,21 @@ impl Pair {
         let sa = Self::send(&mut self.a, prog);
         let sb = Self::send(&mut self.b, prog);
         // safe variants run in parallel with a
-        let sc_early = if variant != "unsafe" { Some(Self::send_v(&mut self.c, prog, variant)) } else { None };
+        let jit = variant == "jitify";
+        if jit && self.d.is_none() {
+            self.d = Some(spawn_server_jit(&self.racket, &self.runner, false, true));
+        }
+        let (cv, wire) = if jit { (self.d.as_mut().unwrap(), "none") } else { (&mut self.c, variant) };
+        let sc_early = if variant != "unsafe" { Some(Self::send_v(cv, prog, wire)) } else { None };
         let ra = Self::recv(&mut self.a, sa, lim);
         let rc = if variant != "unsafe" || unsafe_eligible(&ra) {
-            let sc = match sc_early { Some(x) => x, None => Self::send_v(&mut self.c, prog, variant) };
-            let rc = Self::recv(&mut self.c, sc, lim);
+            let cv = if jit { self.d.as_mut().unwrap() } else { &mut self.c };
+            let sc = match sc_early { Some(x) => x, None => Self::send_v(cv, prog, wire) };
+            let rc = Self::recv(cv, sc, lim);
             if !matches!(rc, Res::Line(_)) {
-                let _ = self.c.child.kill();
-                let _ = self.c.child.wait();
-                self.c = spawn_server(&self.racket, &self.runner, false);
+                let _ = cv.child.kill();
+                let _ = cv.child.wait();
+                *cv = spawn_server_jit(&self.racket, &self.runner, false, jit);
                 self.restarts += 1;
             }
             Some(rc)
@@ -188,7 +210,10 @@ impl Pair {
         drop(self.a.stdin);
         drop(self.b.stdin);
         drop(self.c.stdin);
-        for c in [&mut self.a.child, &mut self.b.child, &mut self.c.child] {
+        let mut d = self.d.take().map(|d| { drop(d.stdin); d.child });
+        let mut children = vec![&mut self.a.child, &mut self.b.child, &mut self.c.child];
+        if let Some(dc) = d.as_mut() { children.push(dc); }
+        for c in children {
             let t = Instant::now();
             loop {
                 if let Ok(Some(_)) = c.try_wait() {
@@ -415,7 +440,7 @@ const REPRO_VARIANT: &str = r#"#!/usr/bin/env bash
 # Repro for signature @SIG@ (oracle @ORACLE@, kind @KIND@).
 # Runs prog.rkt through runner.rkt twice with the build's racket, both
 # compiled to machine code: default, and with optimizer variant @ORACLE@
-# (runner.rkt VARIANTS).  For `unsafe` the default run must be eligible (ok,
+# (runner.rkt VARIANTS; `jitify` = env PLT_CS_COMPILE_LIMIT=10).  For `unsafe` the default run must be eligible (ok,
 # no exception raised and caught), else the case is not comparable.
 # exit 1: failure reproduces; 0: it does not; 2: cannot decide.
 B=$(cd "$1" 2>/dev/null && pwd) || exit 2
@@ -424,7 +449,7 @@ R="$B/src/racket/bin/racket"
 cd "$(dirname "$0")"
 KIND=@KIND@
 VAR=@ORACLE@
-a=$(env -u PLT_CS_INTERP RKT_CASE_TIMEOUT=20 timeout -k 5 120 "$R" runner.rkt file prog.rkt none 2>&1); ca=$?
+a=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=20 timeout -k 5 120 "$R" runner.rkt file prog.rkt none 2>&1); ca=$?
 res() { printf '%s
 ' "$1" | grep -E $'^(ok|exn|raise|timeout|oom)	|^oom$' | tail -1; }
 ra=$(res "$a")
@@ -434,7 +459,11 @@ if [ "$VAR" = unsafe ]; then
   case "$ra" in ok*) ;; *) exit 0;; esac
   case "$ra" in *"(exn "*|*"caught "*) exit 0;; esac
 fi
-c=$(env -u PLT_CS_INTERP RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
+if [ "$VAR" = jitify ]; then
+  c=$(env -u PLT_CS_INTERP PLT_CS_COMPILE_LIMIT=10 RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt none 2>&1); cc=$?
+else
+  c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
+fi
 rc=$(res "$c")
 case $KIND in
   died)
