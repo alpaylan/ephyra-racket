@@ -225,6 +225,21 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `equal?` of hashes; never iteration order). Area tags `lib-num`, `lib-numstr`, `lib-cmp`,
      `lib-string`, `lib-char`, `lib-bytes`, `lib-symbol`, `lib-regexp`, `lib-print`, `lib-list`,
      `lib-hash`, `lib-typed`.
+   - `local`, `localpart`, `localzo` (metamorphic, steering round 8; runner.rkt `local-module`):
+     the generated module-level items (all for `local`; for `localpart`/`localzo` a suffix
+     starting at an index chosen from the program text, the rest stays at module level) are
+     moved into an internal-definition body, either `(define (main%) <items> (void)) (main%)` or a
+     module-level `(let () <items> (void))`. Module-level constants, known procedures and
+     variables become letrec* locals of one closure: schemify's letrec/lift/mutated-state
+     handling of local bindings, Chez cpletrec, closure conversion, boxes for captured `set!`
+     locals, inlining by cp0 instead of schemify's cross-form known info. A module body prints
+     its expression forms' values with `current-print` and runs each in a default-tag prompt
+     (reference `module`), so expression items become `(call-with-values (lambda () e)
+     local-print%)` and, for half the programs, also get a `call-with-continuation-prompt`.
+     Generated names are unique and refer only to earlier definitions, so internal-definition
+     (`letrec-syntaxes+values`, left to right) semantics give the same output. `localzo` =
+     `localpart` + zo round trip. About a fifth of the drawn cases.
+     `racket runner.rkt macrodump prog.rkt local` prints the rewrite.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

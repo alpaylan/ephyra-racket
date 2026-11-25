@@ -63,7 +63,8 @@
 ;;   gcsplit  gc, then split, each module through a zo round trip
 (define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
                    "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"
-                   "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"))
+                   "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"
+                   "local" "localpart" "localzo"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -734,6 +735,49 @@
 (define chez-effort (vm-eval 'cp0-effort-limit))
 (define chez-unroll (vm-eval 'cp0-outer-unroll-limit))
 
+;; ---------------------------------------------------------------------
+;; Metamorphic "local" rewrite (variants local, localpart; steering round 8).
+;; The generated module-level items (all of them for `local`, a suffix
+;; chosen from the program text for `localpart`) are moved into the body of
+;; a function, an internal-definition context:
+;;   (define (main%) <items'> (void)) (main%)       ; or
+;;   (let () <items'> (void))                       ; a module-level expression
+;; Module-level definitions (constants for schemify, known procedures,
+;; cross-form inlining) become letrec* bindings of one closure body: Chez
+;; cpletrec, closure conversion, local set! boxes, schemify's lift and
+;; mutated-state analysis, inlining by cp0 instead of schemify.  A module body
+;; prints the values of its expression forms with `current-print` and runs
+;; each in a prompt for the default tag (reference/syntax.scrbl `module`);
+;; an internal body discards them, so each expression item e becomes
+;; (call-with-values (lambda () e) local-print%), and half of the programs
+;; also wrap it in `call-with-continuation-prompt`.  Definitions keep their
+;; order; generated names are unique and only refer to earlier definitions
+;; (valid_program), so letrec* semantics equal the module's.  Expected:
+;; reference/syntax.scrbl, internal definitions are `letrec-syntaxes+values`
+;; with the same left-to-right evaluation; output must be identical.
+(define (local-module form src [part? #f])
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append (if part? "localpart" "local") src)))
+  (define k (if part? (rng (add1 (length items))) 0))
+  (define-values (keep moved) (split-at items k))
+  (define prompt? (zero? (rng 2)))
+  (define (def? f) (and (pair? f) (memq (car f) '(define define-values))))
+  (define body
+    (for/list ([f moved])
+      (cond [(def? f) f]
+            [prompt? `(call-with-values
+                       (lambda () (call-with-continuation-prompt (lambda () ,f)))
+                       local-print%)]
+            [else `(call-with-values (lambda () ,f) local-print%)])))
+  (define wrapped
+    (if (zero? (rng 2))
+        `((define (main%) ,@body (void)) (main%))
+        `((let () ,@body (void)))))
+  `(module m ,lang ,@pre
+     (define (local-print% . vs) (for-each (current-print) vs))
+     ,@keep ,@wrapped))
+
 (define (variant-source variant src)
   (if (equal? variant "unsafe")
       (string-replace src "(module m racket/base\n" "(module m racket/base\n(#%declare #:unsafe)\n" #:all? #f)
@@ -846,6 +890,9 @@
                      [("gcsplit")
                       (for ([f (split-module (gc-module form src))])
                         (eval (zo-round-trip (compile f))))]
+                     [("local") (eval (local-module form src))]
+                     [("localpart") (eval (local-module form src #t))]
+                     [("localzo") (eval (zo-round-trip (compile (local-module form src #t))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
                    (when (equal? variant "macrosub")
@@ -912,6 +959,8 @@
                 [("ctlsplit") (split-module (opaque-module form src #t))]
                 [("gc" "gczo") (list (gc-module form src))]
                 [("gcsplit") (split-module (gc-module form src))]
+                [("local") (list (local-module form src))]
+                [("localpart" "localzo") (list (local-module form src #t))]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])
