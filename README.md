@@ -104,6 +104,28 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `racket runner.rkt splitdump prog.rkt` prints the two modules. The split variants get ~half of
      the drawn cases (`VARIANT_DRAW` in main.rs). 30% of generated functions get a small body
      (depth 1-2) so they are under the inlining size limits.
+   - `macro`, `macrozo`, `macrosplit` (metamorphic, steering round 4; runner.rkt `macro-module`,
+     `macro-split`): the generated items are rewritten through hygienic macros defined in the module
+     (expander: scope sets, re-represented as sorted lists with a Zobrist hash in f1a34e208d,
+     2026-11-16; binding resolution, use-site scopes, serialization of syntax). Each macro expands to
+     the form it replaces plus bindings user code cannot see; the introduced binders deliberately reuse
+     the program's own variable names, `tap`, `mv` and `tmp`, and every template keeps the user
+     expression in tail position (marks, tail calls unchanged). Rewrites (each site with some
+     probability, a deterministic function of the program text): `if`→`m-if` (made by a
+     macro-defining macro), application→`m-app` (macro-defining macro with `(... ...)`) or `m-app2`
+     (syntax-case, `generate-temporaries`), `let`/`let*`/named let/`lambda`/`set!` wrappers,
+     module-level and internal `define`→`m-def`/`m-define` (macro uses that produce definitions next
+     to a hygienically introduced definition of a colliding name), `m-deep k e` (a recursive macro
+     wrapping an argument in k ≤ 40 lets: large scope sets), `m-tap` (rebinding `tap`/`mv`/`tmp`
+     around user code), and function parameters replaced by `define-syntax` +
+     `make-set!-transformer` macros in the function body (internal-definition context). Only forms
+     whose grammar the rewriter knows are rewritten; unknown forms are left alone. Expected: macro
+     expansion is semantics-preserving and hygienic (reference/syntax-model.scrbl), so output must
+     equal the unrewritten module's. `macro` evals in-memory, `macrozo` compiles + writes + reads
+     back, `macrosplit` splits (as `split`), rewrites both modules with the macros defined in `a`
+     (exported by `all-defined-out`) and round-trips each through a .zo, so `m` expands against
+     deserialized macros. `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten
+     module(s). They get a third of the drawn cases.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 
