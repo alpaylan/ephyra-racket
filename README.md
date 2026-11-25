@@ -187,6 +187,41 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      They get about a quarter of the drawn cases. Cost: ~0.17-0.22 s per case vs 0.06 s default.
      A 25-program probe on the coverage build reached +12 000 C regions (gc.c, gc-par.inc,
      gc-oce.inc) over the cumulative profile.
+   - `ref93` (second reference, steering round 7): the same module, variant `none`, on a sixth
+     server (`f`, started on first use) running the released **Racket 9.3 CS** (minimal),
+     which build.sh copies into `<build>/ref93` (from `$REF93_SRC` or the tarball `$REF93_TGZ` if set, else
+     download.racket-lang.org) with the runner compiled by it in `<build>/harness93`. Compared
+     only when trunk machine code and the trunk interpreter agree (otherwise the `diff` oracle
+     owns the case), so a difference lies in code both trunk modes share — the rumble/Chez
+     libraries compiled by the changed Chez compiler (cmov pass 5d5568ec15, branchless
+     flmin/flmax, flround instructions, fxbit-count inline), schemify, the expander (scope
+     sets), io — or is a documented change since 9.3. Comparison form (`norm93`, mirrored in
+     the repro's python): error-message texts dropped (inside `show` output and the final exn
+     line; struct type and `show`'s kind stay), and when the program uses min/max the sign of
+     zero is ignored (05afec9201 documents flmax's changed -0.0 result). Not compared: 9.3
+     crashes/hangs/internal errors (9.3's problems), programs using names 9.3 lacks
+     (`NEW_SINCE_93`, e.g. `flhypot`; also any 9.3 unbound-identifier/syntax error), and
+     differing programs that capture continuations (9.3 has the unboxed-flonum continuation
+     bug fixed by patch 003). Kinds: `ref93__value__*`, `ref93__error__*`. **Triage every
+     ref93 finding against `git log v9.3..HEAD`** (regexp repairs, expt with
+     most-negative-fixnum, log1+/atanh accuracy, Unicode 18, struct field limit, reader `#s`)
+     before calling it a regression; also check whether trunk or 9.3 is the one that is wrong.
+     About 1/5 of drawn cases.
+     To give this oracle shared library code to check, the generator got **library primitives**
+     (gen.rs `lib_op`, ~30% of `Val` expressions and 5% of typed ones via `lib_typed`): exact
+     rationals and complex numbers (`/`, `expt`, `sqrt`/`exp`/`log`/trig, `make-polar`,
+     `rationalize`, `exact->inexact` of large rationals, `integer-sqrt/remainder`,
+     `bitwise-bit-field`, big shifts, exact/inexact comparisons), `number->string` (radix) and
+     `string->number` on a pool of tricky notations, round trips; strings with Unicode special
+     casing (ß, final sigma, İ, ǅ, ﬁ, combining marks) through up/down/fold/titlecase and the
+     four normalizations, string/char comparisons and `char-general-category` etc., UTF-8 and
+     Latin-1 bytes conversions with invalid sequences, symbols/keywords, simple regexps
+     (match, positions, split, replace), printing to string ports (`write`/`display`/`print`,
+     `format` directives) and reading back, `sort`/`foldl`/`assv`/`member` on numeric lists,
+     mutable (`make-hash`/`hasheqv`/`hashalw`) and immutable hash tables (count/ref/update/remove,
+     `equal?` of hashes; never iteration order). Area tags `lib-num`, `lib-numstr`, `lib-cmp`,
+     `lib-string`, `lib-char`, `lib-bytes`, `lib-symbol`, `lib-regexp`, `lib-print`, `lib-list`,
+     `lib-hash`, `lib-typed`.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 
