@@ -703,6 +703,11 @@ impl<'a> Gen<'a> {
                     self.scope.push((iv.clone(), it, true));
                     let body = self.expr(ret, d);
                     E::node(ret, "internal-define", &format!("(define {iv} $0) $1"), vec![ie, body]).binding(&[&iv])
+                } else if self.rng.chance(0.3) {
+                    // small body (one or two operations): under schemify's
+                    // inlining size limits, also across modules (split variants)
+                    let sd = 1 + self.rng.below(2);
+                    self.expr(ret, sd)
                 } else {
                     self.expr(ret, d)
                 };

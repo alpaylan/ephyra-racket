@@ -73,6 +73,21 @@ Median program 103 nodes / 1.2 KB, median 2 loops, 4 ifs, 3 control forms.
    - `jitify`: a fourth server (started on first use) with `PLT_CS_COMPILE_LIMIT=10`, so every
      module is a "large linklet": schemify's jitify mode (schemify/jitify.rkt), only interior
      functions compiled, the outer body interpreted — the path real modules over 10 000 terms take.
+   - `split`, `splitzo`, `splitmi` (metamorphic, runner.rkt `split-module`): the module is split
+     after its last definition into a provider `(module a racket/base (provide (all-defined-out))
+     <prelude> <items up to the last define>)` and the client `(module m racket/base <requires>
+     (require 'a) <remaining items>)` — mostly the calls of every defined function, so they become
+     cross-module calls (schemify's imported known info: known.rkt, find-known.rkt, known-copy.rkt,
+     cross-module inlining of small functions, struct `pt` accessors, constants). A client cannot
+     `set!` an imported variable, so `(set! x e)` in `m` becomes `(x:set e)` with
+     `(define (x:set v) (set! x v))` added to `a` (generated names are unique, so this is syntactic;
+     `set!` and the setter both return void). `a`'s body runs to completion before `m`'s, in the
+     original order, so output and results must equal the single module's. `split` evals both
+     in-memory, `splitzo` compiles each, writes and reads it back (the known/inline info serialized
+     in the .zo, the `raco make` path), `splitmi` compiles each machine-independent and recompiles.
+     `racket runner.rkt splitdump prog.rkt` prints the two modules. The split variants get ~half of
+     the drawn cases (`VARIANT_DRAW` in main.rs). 30% of generated functions get a small body
+     (depth 1-2) so they are under the inlining size limits.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

@@ -118,7 +118,13 @@ struct Pair {
 /// oracle name of its signatures.
 /// `jitify` is not a runner.rkt variant: it runs on server `d` (env
 /// PLT_CS_COMPILE_LIMIT=10) with variant `none`.
-const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify"];
+const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
+                            "split", "splitzo", "splitmi"];
+/// Draw table: the split variants (module split in two, cross-module
+/// inlining; runner.rkt `split-module`) are newer and get ~half the cases.
+const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
+                                "split", "splitzo", "splitmi", "split", "splitzo", "splitmi",
+                                "split", "splitzo", "splitmi"];
 
 /// `#:unsafe` is only specified when the safe run raises no exn:fail:contract
 /// (syntax.scrbl).  Conservative: the safe machine-code run finished `ok`
@@ -655,7 +661,7 @@ fn main() {
                     let Some(input) = run.draw() else { continue };
                     let iter = input.iteration();
                     // one variant per drawn case; unchanged while it is shrunk
-                    variant.set(VARIANTS[(mix(seed, 7_000_000 + cases) % VARIANTS.len() as u64) as usize]);
+                    variant.set(VARIANT_DRAW[(mix(seed, 7_000_000 + cases) % VARIANT_DRAW.len() as u64) as usize]);
                     let tested = run.test(&input);
                     cases += 1;
                     let l = last.borrow_mut().take();

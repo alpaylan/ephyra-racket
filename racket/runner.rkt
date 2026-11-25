@@ -28,7 +28,64 @@
 ;;   zo       `compile` (serializable), write + read back, eval
 ;;   machind  machine-independent compile, write + read back,
 ;;            compiled-expression-recompile, eval
-(define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"))
+;;   split    the module split in two (split-module below): provider `a` and
+;;            client `m` requiring it, both eval'd in-memory (cross-module
+;;            known-binding/inlining info, schemify known.rkt/find-known.rkt)
+;;   splitzo  same, each module compiled, written and read back (the inline
+;;            info serialized in .zo, as with raco make)
+;;   splitmi  same, machine-independent compile + recompile of each module
+(define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
+                   "split" "splitzo" "splitmi"))
+
+;; Metamorphic split.  The program is `(module m racket/base <prelude>
+;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
+;; Module `a` = prelude + the items up to and including the last definition,
+;; with `(provide (all-defined-out))`; module `m` = the prelude's `require`
+;; + `(require 'a)` + the remaining items.  A module cannot `set!` an
+;; imported variable, so `(set! x e)` in `m` for an `x` defined in `a`
+;; becomes a call of a setter `(define (x:set v) (set! x v))` exported by
+;; `a` (`set!` returns void, so does the setter).  Generated names are
+;; unique (no shadowing), so the rewrite is purely syntactic.  `a` runs to
+;; completion before `m`'s body, exactly as its forms ran first in the one
+;; module, so output and results must be identical.
+(define (split-module form)
+  (define lang (caddr form))         ; racket/base
+  (define forms (cdddr form))
+  (define (show-def? f) (and (pair? f) (eq? (car f) 'define-syntax-rule)
+                             (pair? (cadr f)) (eq? (car (cadr f)) 'show)))
+  (define-values (pre items)
+    (let loop ([fs forms] [acc '()])
+      (cond [(null? fs) (error 'split "no prelude end")]
+            [(show-def? (car fs)) (values (reverse (cons (car fs) acc)) (cdr fs))]
+            [else (loop (cdr fs) (cons (car fs) acc))])))
+  (define (def? f) (and (pair? f) (memq (car f) '(define define-values))))
+  ;; split after the last definition: the calls of every defined function
+  ;; (the generator's tail) are then all cross-module
+  (define k (for/fold ([k 0]) ([f items] [i (in-naturals 1)]) (if (def? f) i k)))
+  (define-values (prefix rest) (split-at items k))
+  (define (defined-names f)
+    (cond [(not (pair? f)) '()]
+          [(eq? (car f) 'define) (list (if (pair? (cadr f)) (car (cadr f)) (cadr f)))]
+          [(eq? (car f) 'define-values) (cadr f)]
+          [else '()]))
+  (define a-names (append-map defined-names (append pre prefix)))
+  (define mutated (make-hasheq))
+  (define (walk e)
+    (cond [(and (pair? e) (eq? (car e) 'quote)) e]
+          [(and (pair? e) (eq? (car e) 'set!) (pair? (cdr e)) (symbol? (cadr e))
+                (memq (cadr e) a-names) (pair? (cddr e)) (null? (cdddr e)))
+           (define setter (string->symbol (format "~a:set" (cadr e))))
+           (hash-set! mutated (cadr e) setter)
+           (list setter (walk (caddr e)))]
+          [(pair? e) (cons (walk (car e)) (walk (cdr e)))]
+          [else e]))
+  (define rest* (map walk rest))
+  (define reqs (filter (lambda (f) (and (pair? f) (eq? (car f) 'require))) pre))
+  (define setters
+    (for/list ([(x s) (in-hash mutated)])
+      `(define (,s v) (set! ,x v))))
+  (list `(module a ,lang (provide (all-defined-out)) ,@pre ,@prefix ,@setters)
+        `(module m ,lang ,@reqs (require 'a) ,@rest*)))
 
 (define (zo-round-trip c)
   (define o (open-output-bytes))
@@ -123,6 +180,16 @@
                              (zo-round-trip
                               (parameterize ([current-compile-target-machine #f])
                                 (compile form)))))]
+                     [("split")
+                      (for ([f (split-module form)]) (eval f))]
+                     [("splitzo")
+                      (for ([f (split-module form)]) (eval (zo-round-trip (compile f))))]
+                     [("splitmi")
+                      (for ([f (split-module form)])
+                        (eval (compiled-expression-recompile
+                               (zo-round-trip
+                                (parameterize ([current-compile-target-machine #f])
+                                  (compile f))))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
                    (list "ok" (get-output-string out)))))))))
@@ -160,4 +227,9 @@
   [(and (<= 2 (vector-length args) 3) (equal? (vector-ref args 0) "file"))
    (emit (run-program (call-with-input-file (vector-ref args 1) port->string)
                       (if (= (vector-length args) 3) (vector-ref args 2) "none")))]
+  [(and (= (vector-length args) 2) (equal? (vector-ref args 0) "splitdump"))
+   ;; prints the two modules of the split variants (for triage)
+   (for ([f (split-module (read (open-input-string
+                                 (call-with-input-file (vector-ref args 1) port->string))))])
+     (write f real-out) (newline real-out))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])
