@@ -35,6 +35,22 @@ literal pools with edge values (0, -1, fixnum bounds, 2^62, -0.0, +-inf.0, +nan.
 values, all shrink candidates and mutants satisfy `valid_program` (every free name defined earlier).
 Median program 103 nodes / 1.2 KB, median 2 loops, 4 ifs, 3 control forms.
 
+### Dynamic kind (`Val`, steering round 3)
+
+Besides the typed int/flonum/boolean expressions, a dynamically typed kind `Val` mixes fixnums,
+bignums, flonums, booleans, pairs/lists, `'()`, strings, chars, symbols, vectors, boxes and void
+(`val_op`, `val_to_int` in gen.rs). Constructs: `cons`/`list`/`list*`, `pair?`-guarded `car`/`cdr`,
+`reverse`/`append`/`member`/`length` behind `list?`, a bounded cdr-walking loop, mixed-type `if` arms,
+`case` on symbols/chars/strings/`()` (equal?), boxes, vectors holding any value, char/string/symbol
+conversions, and type dispatch (`cond` over `fixnum?`/`flonum?`/`pair?`/`string?`/... with
+type-specific operations in each arm) plus type predicates and `equal?` as booleans. Function
+parameters, returns, `let` bindings and `set!` targets can be `Val`, so one function sees arguments of
+several types (Chez cptypes type recovery, schemify's known-type info, the `notr` variant). Val is
+woven in at ~5-15% of the int/fl/bool choices so old shapes stay reachable. Only `equal?` is used on
+Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area tags (PRIORITY):
+`type-dispatch`, `type-guard`, `pair-guard`, `case-any`, `box`, `vector-any`, `list-op`, `if-mixed`,
+`char`, `symbol`, `type-pred`, `equal`, `pair`.
+
 ## Oracles
 
 1. **diff** (`diff__{value,error,errmsg}__<area>`): two long-lived `racket runner.rkt server`

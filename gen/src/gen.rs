@@ -13,6 +13,9 @@ pub enum Ty {
     Int,
     Fl,
     Bool,
+    /// Dynamically typed: fixnums, bignums, flonums, booleans, pairs/lists,
+    /// null, strings, chars, symbols, vectors, boxes, void.
+    Val,
     Stmt,
 }
 
@@ -120,6 +123,13 @@ const FL_POOL: &[&str] = &[
     "9007199254740992.0", "9007199254740991.0", "1e-10", "123456.789", "-7.25", "4503599627370496.5",
 ];
 const BOOL_POOL: &[&str] = &["#t", "#f"];
+// Literals of the dynamic kind. Comparisons on Val use only equal? (eq?/eqv?
+// on numbers, chars, strings and quoted literals are unspecified).
+const VAL_POOL: &[&str] = &[
+    "'()", "'a", "'b", "\"ab\"", "\"\"", "#\\a", "#\\Z", "#\\0", "'(1 2)", "'(a . 2.5)", "(void)",
+    "#t", "#f", "0", "-1", "1152921504606846975", "1152921504606846976", "0.0", "-0.0", "+nan.0",
+    "2.0", "'#(1 b)", "'(())",
+];
 
 #[derive(Clone)]
 struct Fun {
@@ -171,6 +181,7 @@ impl<'a> Gen<'a> {
             Ty::Int => *self.rng.pick(INT_POOL),
             Ty::Fl => *self.rng.pick(FL_POOL),
             Ty::Bool => *self.rng.pick(BOOL_POOL),
+            Ty::Val => *self.rng.pick(VAL_POOL),
             Ty::Stmt => "(void)",
         };
         E::atom(ty, s)
@@ -187,6 +198,7 @@ impl<'a> Gen<'a> {
             Ty::Int => self.int_op(d),
             Ty::Fl => self.fl_op(d),
             Ty::Bool => self.bool_op(d),
+            Ty::Val => self.val_op(d),
             Ty::Stmt => self.leaf(ty),
         }
     }
@@ -361,6 +373,7 @@ impl<'a> Gen<'a> {
                     E::node(Ty::Int, "for-sum", &format!("(for/sum ([{i} (in-range $0)]) (let ([{acc} $1]) $2))"), vec![n, a, body]).binding(&[&i, &acc])
                 }
             }
+            80..=85 => self.val_to_int(d),
             _ => self.call_or_leaf(Ty::Int, d),
         }
     }
@@ -433,6 +446,22 @@ impl<'a> Gen<'a> {
                 )
                 .binding(&[&i, &acc])
             }
+            78..=80 => {
+                let v = self.expr(Ty::Val, d - 1);
+                let a = self.expr(Ty::Fl, d - 1);
+                let t = self.fresh("t");
+                match self.rng.below(3) {
+                    0 => E::node(Ty::Fl, "type-guard", &format!("(let ([{t} $0]) (if (flonum? {t}) {t} $1))"), vec![v, a]),
+                    1 => {
+                        let u = self.fresh("u");
+                        E::node(Ty::Fl, "type-guard", &format!("(let ([{t} $0] [{u} $1]) (if (real? {t}) (fl+ (real->double-flonum {t}) {u}) {u}))"), vec![v, a])
+                    }
+                    _ => {
+                        let u = self.fresh("u");
+                        E::node(Ty::Fl, "type-guard", &format!("(let* ([{t} $0] [{u} $1]) (cond [(flonum? {t}) (fl* {t} {u})] [(fixnum? {t}) (fx->fl {t})] [(pair? {t}) 1.5] [else {u}]))"), vec![v, a])
+                    }
+                }
+            }
             _ => self.call_or_leaf(Ty::Fl, d),
         }
     }
@@ -470,6 +499,20 @@ impl<'a> Gen<'a> {
                     0 => self.un(Ty::Bool, "logic", "not", Ty::Bool, d),
                     1 => self.bin(Ty::Bool, "logic", "and", Ty::Bool, d),
                     _ => self.bin(Ty::Bool, "logic", "or", Ty::Bool, d),
+                }
+            }
+            90..=95 => {
+                let v = self.expr(Ty::Val, d - 1);
+                if self.rng.chance(0.25) {
+                    let w = self.expr(Ty::Val, d - 1);
+                    E::node(Ty::Bool, "equal", "(equal? $0 $1)", vec![v, w])
+                } else {
+                    let op = *self.rng.pick(&[
+                        "pair?", "null?", "list?", "string?", "char?", "symbol?", "fixnum?", "flonum?",
+                        "boolean?", "number?", "exact-integer?", "real?", "integer?", "vector?", "box?",
+                        "void?", "not", "procedure?", "exact-nonnegative-integer?", "byte?", "rational?",
+                    ]);
+                    E::node(Ty::Bool, "type-pred", &format!("({op} $0)"), vec![v])
                 }
             }
             _ => self.call_or_leaf(Ty::Bool, d),
@@ -516,7 +559,7 @@ impl<'a> Gen<'a> {
                 E::node(ty, "cond", "(cond [$0 $1] [$2 $3] [else $4])", vec![c1, a, c2, b, e])
             }
             34..=45 => {
-                let vt = *self.rng.pick(&[Ty::Int, Ty::Fl, Ty::Bool, Ty::Int]);
+                let vt = *self.rng.pick(&[Ty::Int, Ty::Fl, Ty::Bool, Ty::Int, Ty::Val]);
                 let v = self.expr(vt, d - 1);
                 let x = self.fresh("x");
                 self.scope.push((x.clone(), vt, true));
@@ -544,7 +587,10 @@ impl<'a> Gen<'a> {
             }
             51..=55 => {
                 // set! a settable variable of the same type in scope, else module var
-                let sty = *self.rng.pick(&[Ty::Int, Ty::Fl]);
+                let mut sty = *self.rng.pick(&[Ty::Int, Ty::Fl, Ty::Int, Ty::Fl, Ty::Val]);
+                if sty == Ty::Val && self.settable(Ty::Val).is_none() {
+                    sty = Ty::Int;
+                }
                 let local = self.settable(sty);
                 let target = local.clone().unwrap_or_else(|| if sty == Ty::Int { "mv".into() } else { "mf".into() });
                 let v = self.expr(sty, d - 1);
@@ -611,6 +657,7 @@ impl<'a> Gen<'a> {
                 let comb = match ty {
                     Ty::Int => "(+ $0 ($F (fx- $N 1) $1))",
                     Ty::Fl => "(fl+ $0 ($F (fx- $N 1) $1))",
+                    Ty::Val => "(cons $0 ($F (fx- $N 1) $1))",
                     _ => "(if $0 ($F (fx- $N 1) $1) #f)",
                 };
                 let rec = comb.replace("$F", &f).replace("$N", &n);
@@ -633,7 +680,7 @@ impl<'a> Gen<'a> {
             }
             90..=94 => {
                 // immediate lambda application / unused local function
-                let at = *self.rng.pick(&[Ty::Int, Ty::Fl, Ty::Bool]);
+                let at = *self.rng.pick(&[Ty::Int, Ty::Fl, Ty::Bool, Ty::Val]);
                 let a = self.expr(at, d - 1);
                 let x = self.fresh("x");
                 let u = self.fresh("unused");
@@ -661,7 +708,134 @@ impl<'a> Gen<'a> {
     }
 
     fn rand_ty(&mut self) -> Ty {
-        *self.rng.pick(&[Ty::Int, Ty::Int, Ty::Fl, Ty::Fl, Ty::Bool])
+        *self.rng.pick(&[Ty::Int, Ty::Int, Ty::Fl, Ty::Fl, Ty::Bool, Ty::Int, Ty::Fl, Ty::Val])
+    }
+
+    /// Inject a typed expression into the dynamic kind.
+    fn inject(&mut self, d: usize) -> E {
+        let t = *self.rng.pick(&[Ty::Int, Ty::Fl, Ty::Bool, Ty::Int, Ty::Fl]);
+        let a = self.expr(t, d);
+        E::node(Ty::Val, "", "$0", vec![a])
+    }
+
+    fn val_to_int(&mut self, d: usize) -> E {
+        let v = self.expr(Ty::Val, d - 1);
+        let t = self.fresh("t");
+        match self.rng.below(6) {
+            0 | 1 => {
+                let a = self.expr(Ty::Int, d - 1);
+                {
+                    let u = self.fresh("u");
+                    E::node(Ty::Int, "type-guard", &format!("(let ([{t} $0] [{u} $1]) (if (fixnum? {t}) (fx+/wraparound {t} {u}) {u}))"), vec![v, a])
+                }
+            }
+            2 | 3 => {
+                let a = self.expr(Ty::Int, d - 1);
+                E::node(
+                    Ty::Int,
+                    "type-dispatch",
+                    &format!(
+                        "(let ([{t} $0]) (cond [(fixnum? {t}) {t}] [(exact-integer? {t}) (integer-length {t})] [(flonum? {t}) (if (= {t} {t}) (fl->exact-integer (flfloor (flmin 1e18 (flmax -1e18 {t})))) -2)] [(pair? {t}) (+ 10 (if (list? {t}) (length {t}) 100))] [(string? {t}) (string-length {t})] [(char? {t}) (char->integer {t})] [(symbol? {t}) (string-length (symbol->string {t}))] [(null? {t}) 20] [(vector? {t}) (vector-length {t})] [(box? {t}) 30] [(boolean? {t}) (if {t} 41 40)] [else $1]))"
+                    ),
+                    vec![v, a],
+                )
+            }
+            4 => E::node(Ty::Int, "list-op", &format!("(let ([{t} $0]) (if (list? {t}) (length {t}) -1))"), vec![v]),
+            _ => {
+                let a = self.expr(Ty::Int, d - 1);
+                E::node(Ty::Int, "list-op", &format!("(let loop ([{t} $0] [n 0]) (if (and (pair? {t}) (fx< n 8)) (loop (cdr {t}) (fx+ n 1)) (if (null? {t}) n $1)))"), vec![v, a])
+            }
+        }
+    }
+
+    fn val_op(&mut self, d: usize) -> E {
+        let r = self.rng.below(100);
+        match r {
+            0..=19 => self.inject(d - 1),
+            20..=31 => {
+                let a = self.expr(Ty::Val, d - 1);
+                let b = self.expr(Ty::Val, d - 1);
+                match self.rng.below(4) {
+                    0 | 1 => E::node(Ty::Val, "pair", "(cons $0 $1)", vec![a, b]),
+                    2 => E::node(Ty::Val, "pair", "(list $0 $1)", vec![a, b]),
+                    _ => {
+                        let c = self.expr(Ty::Val, d - 1);
+                        E::node(Ty::Val, "pair", "(list* $0 $1 $2)", vec![a, b, c])
+                    }
+                }
+            }
+            32..=43 => {
+                let v = self.expr(Ty::Val, d - 1);
+                let t = self.fresh("t");
+                match self.rng.below(5) {
+                    0 => E::node(Ty::Val, "pair-guard", &format!("(let ([{t} $0]) (if (pair? {t}) (car {t}) {t}))"), vec![v]),
+                    1 => E::node(Ty::Val, "pair-guard", &format!("(let ([{t} $0]) (if (pair? {t}) (cdr {t}) '()))"), vec![v]),
+                    2 => E::node(Ty::Val, "list-op", &format!("(let ([{t} $0]) (if (list? {t}) (reverse {t}) (list {t})))"), vec![v]),
+                    3 => {
+                        let w = self.expr(Ty::Val, d - 1);
+                        E::node(Ty::Val, "list-op", &format!("(let ([{t} $0]) (if (list? {t}) (append {t} (list $1)) {t}))"), vec![v, w])
+                    }
+                    _ => {
+                        let w = self.expr(Ty::Val, d - 1);
+                        E::node(Ty::Val, "list-op", "(member $0 (list 1 'a \"ab\" $1 2.0))", vec![v, w])
+                    }
+                }
+            }
+            44..=53 => {
+                // mixed-type if / cond arms
+                let c = self.expr(Ty::Bool, d - 1);
+                let ta = *self.rng.pick(&[Ty::Int, Ty::Fl, Ty::Bool, Ty::Val]);
+                let tb = *self.rng.pick(&[Ty::Int, Ty::Fl, Ty::Val]);
+                let a = if self.rng.chance(0.5) { self.leaf(ta) } else { self.expr(ta, d - 1) };
+                let b = if self.rng.chance(0.5) { self.leaf(tb) } else { self.expr(tb, d - 1) };
+                E::node(Ty::Val, "if-mixed", "(if $0 $1 $2)", vec![c, a, b])
+            }
+            54..=63 => {
+                let i = self.expr(Ty::Int, d - 1);
+                let t = self.fresh("t");
+                match self.rng.below(5) {
+                    0 => E::node(Ty::Val, "char", &format!("(let ([{t} $0]) (integer->char (+ 48 (modulo {t} 75))))"), vec![i]),
+                    1 => E::node(Ty::Val, "string", "(number->string $0)", vec![i]),
+                    2 => E::node(Ty::Val, "string", &format!("(let ([{t} (modulo $0 4)]) (substring \"hello\" {t} (+ {t} 1)))"), vec![i]),
+                    3 => E::node(Ty::Val, "symbol", &format!("(string->symbol (string-append \"s\" (number->string (modulo $0 3))))"), vec![i]),
+                    _ => {
+                        let v = self.expr(Ty::Val, d - 1);
+                        E::node(Ty::Val, "string", &format!("(let ([{t} $1]) (if (string? {t}) (string-append {t} (number->string $0)) (if (char? {t}) (string {t} #\\x) {t})))"), vec![i, v])
+                    }
+                }
+            }
+            64..=71 => {
+                let v = self.expr(Ty::Val, d - 1);
+                let w = self.expr(Ty::Val, d - 1);
+                let b = self.fresh("bx");
+                match self.rng.below(3) {
+                    0 => E::node(Ty::Val, "box", &format!("(let ([{b} (box $0)]) (set-box! {b} (cons $1 (unbox {b}))) (unbox {b}))"), vec![v, w]),
+                    1 => {
+                        let i = self.expr(Ty::Int, d - 1);
+                        E::node(Ty::Val, "vector-any", &format!("(let ([{b} (vector $0 $1)]) (vector-set! {b} (modulo $2 2) (cons 1 (vector-ref {b} 0))) (vector-ref {b} 1))"), vec![v, w, i])
+                    }
+                    _ => E::node(Ty::Val, "vector-any", "(vector->list (vector $0 $1))", vec![v, w]),
+                }
+            }
+            72..=79 => {
+                let v = self.expr(Ty::Val, d - 1);
+                let a = self.expr(Ty::Val, d - 1);
+                let b = self.expr(Ty::Val, d - 1);
+                let e = self.leaf(Ty::Val);
+                E::node(Ty::Val, "case-any", "(case $0 [(a 0) $1] [(#\\a \"ab\" 2.0 ()) $2] [else $3])", vec![v, a, b, e])
+            }
+            80..=87 => {
+                let v = self.expr(Ty::Val, d - 1);
+                let t = self.fresh("t");
+                E::node(
+                    Ty::Val,
+                    "type-dispatch",
+                    &format!("(let ([{t} $0]) (cond [(fixnum? {t}) (fx->fl {t})] [(flonum? {t}) (if (fl< {t} 0.0) 'neg {t})] [(string? {t}) (string->list {t})] [(char? {t}) (char-upcase {t})] [(pair? {t}) (cdr {t})] [(symbol? {t}) (symbol->string {t})] [else (not {t})]))"),
+                    vec![v],
+                )
+            }
+            _ => self.call_or_leaf(Ty::Val, d),
+        }
     }
 
     /// One top-level item.
@@ -851,6 +1025,7 @@ fn simplest(ty: Ty) -> Option<E> {
         Ty::Int => Some(E::atom(Ty::Int, "0")),
         Ty::Fl => Some(E::atom(Ty::Fl, "0.0")),
         Ty::Bool => Some(E::atom(Ty::Bool, "#t")),
+        Ty::Val => Some(E::atom(Ty::Val, "'()")),
         Ty::Stmt => None,
     }
 }

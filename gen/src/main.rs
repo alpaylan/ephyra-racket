@@ -358,7 +358,8 @@ fn classify_all(a: &Res, b: &Res, c: &Option<Res>, variant: &'static str) -> Ver
 const PRIORITY: &[&str] = &[
     "escape", "dynamic-wind", "wcm", "parameterize", "handlers", "closure-set", "unused-fn",
     "letrec-loop", "fl-loop", "for-fold", "for-sum", "values", "struct-mutate", "struct",
-    "vector-mutate", "vector", "flvector", "hash", "flbit-field", "flround", "flmin-max", "fl->int",
+    "vector-mutate", "vector", "flvector", "hash", "type-dispatch", "type-guard", "pair-guard",
+    "case-any", "box", "vector-any", "list-op", "if-mixed", "char", "symbol", "type-pred", "equal", "pair", "flbit-field", "flround", "flmin-max", "fl->int",
     "int->fl", "fixnum-shift", "fixnum", "shift", "flonum", "generic-fl", "fl-compare", "fx-compare",
     "case", "cond", "if", "set", "lambda-app", "internal-define", "let", "call", "tap", "list",
     "string", "fl-predicate", "predicate", "compare", "generic-arith", "logic", "begin",
