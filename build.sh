@@ -52,6 +52,31 @@ cp "$HERE/racket/runner.rkt" "$BUILD/harness/runner.rkt"
 ( cd "$BUILD/harness" && "$RACKET" -l racket/base -l compiler/cm \
     -e '(managed-compile-zo "runner.rkt")' )
 
+# Second reference (variant ref93): released Racket 9.3 CS (minimal), copied
+# into the build dir so repro.sh needs nothing outside it, and the runner
+# compiled by it.
+REF93_SRC=${REF93_SRC:-}
+REF93_TGZ=${REF93_TGZ:-}
+REF93_URL=https://download.racket-lang.org/releases/9.3/installers/racket-minimal-9.3-x86_64-linux-cs.tgz
+R93="$BUILD/ref93/racket/bin/racket"
+if [ ! -x "$R93" ]; then
+  rm -rf "$BUILD/ref93"; mkdir -p "$BUILD/ref93"
+  if [ -x "$REF93_SRC/racket/bin/racket" ]; then
+    rsync -a "$REF93_SRC"/ "$BUILD/ref93"/
+  else
+    [ -f "$REF93_TGZ" ] || { REF93_TGZ="$BUILD/rm93.tgz"; curl -fsSL -o "$REF93_TGZ" "$REF93_URL"; }
+    tar -xzf "$REF93_TGZ" -C "$BUILD/ref93"
+  fi
+fi
+if [ -x "$R93" ]; then
+  mkdir -p "$BUILD/harness93"
+  cp "$HERE/racket/runner.rkt" "$BUILD/harness93/runner.rkt"
+  ( cd "$BUILD/harness93" && "$R93" -l racket/base -l compiler/cm \
+      -e '(managed-compile-zo "runner.rkt")' ) || rm -f "$BUILD/harness93/runner.rkt"
+else
+  echo "warning: no Racket 9.3, variant ref93 disabled" >&2
+fi
+
 if [ "$MODE" = coverage ]; then
   rm -rf "$BUILD/build-profraw"
   # The executable statically links the Chez kernel and rktio.

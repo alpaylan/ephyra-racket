@@ -194,6 +194,10 @@ impl<'a> Gen<'a> {
         if self.rng.chance(0.33) {
             return self.control(ty, d);
         }
+        // Library primitives (round 7), mostly through the dynamic kind.
+        if ty != Ty::Stmt && ty != Ty::Val && self.rng.chance(0.05) {
+            return self.lib_typed(ty, d);
+        }
         match ty {
             Ty::Int => self.int_op(d),
             Ty::Fl => self.fl_op(d),
@@ -842,6 +846,9 @@ impl<'a> Gen<'a> {
     }
 
     fn val_op(&mut self, d: usize) -> E {
+        if self.rng.chance(0.3) {
+            return self.lib_op(d);
+        }
         let r = self.rng.below(100);
         match r {
             0..=19 => self.inject(d - 1),
@@ -1197,4 +1204,214 @@ pub fn program_metrics(p: &Program, _size: usize) -> Vec<(&'static str, f64)> {
 #[ephyra::generator(valid_program, metrics = program_metrics)]
 pub fn programs() -> ProgramGen {
     ProgramGen
+}
+
+// ---------------------------------------------------------------------------
+// Library primitives (steering round 7): exact rationals, complex numbers,
+// number<->string, strings/chars/bytes with Unicode casing, symbols and
+// keywords, sorting and list library, mutable/immutable hash tables,
+// printing to string ports and reading back, simple regexps.  These run
+// the same rumble/Chez library code in machine-code and interpreter mode,
+// so the `ref93` oracle (released Racket 9.3 on the same module) is what
+// checks them.  Results are values of the dynamic kind (or typed through
+// lib_typed).  Only deterministic results: no hash iteration order, no
+// eq? on numbers/chars/strings, no hash codes, no procedure printing.
+
+/// Exact rationals, complex numbers, extra integers and inexact edge cases.
+const NUM_POOL: &[&str] = &[
+    "1/3", "-7/2", "22/7", "1/1024", "-1/3", "3/4", "100000000000000000001/3", "1+2i", "0+1i",
+    "-1.5+0.5i", "1.0+0.0i", "3/4-1/2i", "+inf.0+1i", "12345678901234567890", "-98765432109876543210123",
+    "(expt 2 64)", "(- (expt 2 62))", "1e21", "1e-7", "123.456", "5e-324", "1.7976931348623157e308",
+    "0.30000000000000004", "2/3", "#e1.1", "0", "-0.0", "+nan.0", "-inf.0", "7",
+];
+/// Strings: ASCII, Latin-1 and classic Unicode with special casing
+/// (sharp s, final sigma, dotted I, title-case digraph, ligature,
+/// combining accent), digits, separators.
+const STR_POOL: &[&str] = &[
+    "\"ab\"", "\"\"", "\"Hello World\"", "\"stra\u{df}e\"", "\"\u{3a3}\u{391}\u{3a3}\"", "\"\u{130}stanbul\"",
+    "\"\u{1c5}x\"", "\"\u{fb01}ne\"", "\"e\u{301}\"", "\"\u{e9}t\u{e9}\"", "\"\u{3bb}x.x\"", "\"a,b,,c\"",
+    "\"0123\"", "\"x\\ty\"", "\"  pad \"", "\"aaab\"", "\"ABC\"", "\"-12.5e3\"", "\"\u{1f600}\"",
+];
+/// Strings for string->number (valid and invalid notations).
+const NUMSTR_POOL: &[&str] = &[
+    "\"1/3\"", "\"#e1.5\"", "\"1e400\"", "\"-0\"", "\"#x-ff\"", "\"1.5+2i\"", "\"+inf.0\"", "\"#i1/3\"",
+    "\"12345678901234567890\"", "\".5e-3\"", "\"#b101.1\"", "\"1e-400\"", "\"#e1e30\"", "\"1/0\"", "\"+i\"",
+    "\"#d1.0e2\"", "\"1_000\"", "\"-nan.0\"", "\"#e1.2e-3\"", "\"1#.#\"", "\"#o777\"", "\"1@2\"", "\"#x1.8p3\"",
+    "\"0.1e1\"", "\"-.e1\"", "\"9007199254740993\"", "\"9007199254740993.0\"", "\"#e-0.0\"", "\"2.5e-324\"",
+];
+const CHAR_POOL: &[&str] = &[
+    "#\\a", "#\\Z", "#\\0", "#\\space", "#\\\u{df}", "#\\\u{3c3}", "#\\\u{3a3}", "#\\\u{1c5}", "#\\\u{130}",
+    "#\\\u{e9}", "#\\nul", "#\\\u{2163}", "#\\\u{663}", "#\\_", "#\\tab",
+];
+const BYTES_POOL: &[&str] = &["#\"abc\"", "#\"\"", "#\"\\200\\377a\"", "#\"\\303\\251\"", "#\"\\355\\240\\200\"", "#\"\\360\\237\\230\\200\"", "#\"a\\0b\""];
+const RX_POOL: &[&str] = &[
+    "#rx\"a+b*\"", "#rx\"(a|b)c\"", "#px\"\\\\d+\"", "#rx\"^[^,]*\"", "#px\"(\\\\w+)\\\\s+(\\\\w+)\"", "#rx\"[aeiou]\"",
+    "#rx\"(?i:hello)\"", "#px\"a{2,3}\"", "#rx\"x*\"", "#px\"\\\\bW\"",
+];
+
+impl<'a> Gen<'a> {
+    fn lib_lit(&mut self, pool: &[&'static str]) -> E {
+        E::atom(Ty::Val, self.rng.pick(pool))
+    }
+    /// A number of any kind.
+    fn lib_num(&mut self, d: usize) -> E {
+        if d == 0 {
+            return self.lib_lit(NUM_POOL);
+        }
+        match self.rng.below(10) {
+            0 | 1 => { let e = self.expr(Ty::Int, d - 1); E::node(Ty::Val, "", "$0", vec![e]) }
+            2 | 3 => { let e = self.expr(Ty::Fl, d - 1); E::node(Ty::Val, "", "$0", vec![e]) }
+            4 | 5 | 6 => self.lib_lit(NUM_POOL),
+            _ => self.lib_numop(d - 1),
+        }
+    }
+    fn lib_int(&mut self, d: usize) -> E {
+        if d == 0 || self.rng.chance(0.4) {
+            if self.rng.chance(0.5) {
+                return E::atom(Ty::Int, self.rng.pick(INT_POOL));
+            }
+            return self.small_lit(-3, 70);
+        }
+        self.expr(Ty::Int, d - 1)
+    }
+    fn lib_str(&mut self, d: usize) -> E {
+        if d == 0 || self.rng.chance(0.5) {
+            return self.lib_lit(STR_POOL);
+        }
+        self.lib_strop(d - 1)
+    }
+    fn lib_char(&mut self, d: usize) -> E {
+        if d == 0 || self.rng.chance(0.6) {
+            return self.lib_lit(CHAR_POOL);
+        }
+        let s = self.lib_str(d - 1);
+        let i = self.lib_int(d - 1);
+        let t = self.fresh("t");
+        E::node(Ty::Val, "lib-char", &format!("(let ([{t} $0]) (if (positive? (string-length {t})) (string-ref {t} (modulo $1 (string-length {t}))) #\\x))"), vec![s, i])
+    }
+    /// A list of numbers.
+    fn lib_numlist(&mut self, d: usize) -> E {
+        let n = 1 + self.rng.below(4);
+        let kids: Vec<E> = (0..n).map(|_| self.lib_num(d)).collect();
+        let tpl = format!("(list {})", (0..n).map(|k| format!("${k}")).collect::<Vec<_>>().join(" "));
+        E::node(Ty::Val, "", &tpl, kids)
+    }
+
+    fn lib_numop(&mut self, d: usize) -> E {
+        let t = self.fresh("t");
+        match self.rng.below(30) {
+            0 => { let a = self.lib_num(d); let b = self.lib_num(d); let op = *self.rng.pick(&["/", "+", "*", "-", "max", "min"]); E::node(Ty::Val, "lib-num", &format!("({op} $0 $1)"), vec![a, b]) }
+            1 => { let a = self.lib_int(d); let b = self.lib_int(d); E::node(Ty::Val, "lib-num", "(/ $0 $1)", vec![a, b]) }
+            2 => { let a = self.lib_num(d); E::node(Ty::Val, "lib-num", "(exact->inexact $0)", vec![a]) }
+            3 => { let a = self.lib_num(d); E::node(Ty::Val, "lib-num", "(inexact->exact $0)", vec![a]) }
+            4 => { let a = self.lib_num(d); let k = self.small_lit(-4, 70); E::node(Ty::Val, "lib-num", "(expt $0 $1)", vec![a, k]) }
+            5 => { let a = self.lib_num(d); let b = self.lib_num(d); E::node(Ty::Val, "lib-num", "(expt $0 $1)", vec![a, b]) }
+            6 => { let a = self.lib_num(d); let op = *self.rng.pick(&["sqrt", "exp", "log", "sin", "cos", "atan", "tan", "asin", "acos"]); E::node(Ty::Val, "lib-num", &format!("({op} $0)"), vec![a]) }
+            7 => { let a = self.lib_num(d); let op = *self.rng.pick(&["floor", "ceiling", "round", "truncate", "numerator", "denominator", "abs", "magnitude", "angle", "real-part", "imag-part", "exact-nonnegative-integer?", "integer?", "rational?", "exact?"]); E::node(Ty::Val, "lib-num", &format!("({op} $0)"), vec![a]) }
+            8 => { let a = self.lib_int(d); let r = *self.rng.pick(&["2", "8", "16", "10"]); E::node(Ty::Val, "lib-numstr", &format!("(number->string $0 {r})"), vec![a]) }
+            9 | 10 => { let a = self.lib_num(d); E::node(Ty::Val, "lib-numstr", "(number->string $0)", vec![a]) }
+            11 | 12 => { let s = self.lib_lit(NUMSTR_POOL); if self.rng.chance(0.3) { let r = *self.rng.pick(&["2", "8", "16"]); E::node(Ty::Val, "lib-numstr", &format!("(string->number $0 {r})"), vec![s]) } else { E::node(Ty::Val, "lib-numstr", "(string->number $0)", vec![s]) } }
+            13 => { let a = self.lib_num(d); E::node(Ty::Val, "lib-numstr", &format!("(let ([{t} $0]) (equal? {t} (string->number (number->string {t}))))"), vec![a]) }
+            14 => { let a = self.lib_num(d); let e = self.lib_lit(&["1/100", "1/10", "0", "0.001", "1/3"]); E::node(Ty::Val, "lib-num", "(rationalize (inexact->exact $0) $1)", vec![a, e]) }
+            15 => { let a = self.lib_int(d); let b = self.lib_int(d); let op = *self.rng.pick(&["quotient/remainder", "floor/"]); let op = if op == "floor/" { "quotient/remainder" } else { op }; E::node(Ty::Val, "lib-num", &format!("(call-with-values (lambda () ({op} $0 $1)) list)"), vec![a, b]) }
+            16 => { let a = self.lib_int(d); E::node(Ty::Val, "lib-num", "(call-with-values (lambda () (integer-sqrt/remainder (abs $0))) list)", vec![a]) }
+            17 => { let a = self.lib_int(d); let s = self.small_lit(0, 70); let e = self.small_lit(0, 130); E::node(Ty::Val, "lib-num", &format!("(let ([{t} $1]) (bitwise-bit-field $0 {t} (max {t} $2)))"), vec![a, s, e]) }
+            18 => { let a = self.lib_int(d); let k = self.small_lit(-130, 130); E::node(Ty::Val, "lib-num", "(arithmetic-shift $0 $1)", vec![a, k]) }
+            19 => { let a = self.lib_num(d); let b = self.lib_num(d); E::node(Ty::Val, "lib-num", "(make-rectangular $0 $1)", vec![a, b]) }
+            20 => { let a = self.lib_num(d); let b = self.lib_num(d); E::node(Ty::Val, "lib-num", "(make-polar $0 $1)", vec![a, b]) }
+            21 => { let a = self.lib_num(d); let b = self.lib_num(d); let op = *self.rng.pick(&["=", "<", "<=", ">", ">="]); E::node(Ty::Val, "lib-cmp", &format!("({op} $0 $1)"), vec![a, b]) }
+            22 => { let a = self.lib_num(d); let b = self.lib_num(d); let op = *self.rng.pick(&["eqv?", "equal?"]); E::node(Ty::Val, "lib-cmp", &format!("({op} $0 $1)"), vec![a, b]) }
+            23 => { let a = self.lib_num(d); let b = self.lib_num(d); E::node(Ty::Val, "lib-num", "(atan $0 $1)", vec![a, b]) }
+            24 => { let a = self.lib_num(d); let b = self.lib_num(d); E::node(Ty::Val, "lib-num", "(log $0 $1)", vec![a, b]) }
+            25 => { let l = self.lib_numlist(d); let op = *self.rng.pick(&["max", "min", "+", "*", "gcd", "lcm"]); E::node(Ty::Val, "lib-list", &format!("(apply {op} $0)"), vec![l]) }
+            26 => { let a = self.lib_int(d); let k = self.small_lit(1, 80); E::node(Ty::Val, "lib-num", "(exact->inexact (/ (expt 10 $1) (+ 3 (abs $0))))", vec![a, k]) }
+            27 => { let a = self.lib_num(d); E::node(Ty::Val, "lib-num", &format!("(let ([{t} $0]) (if (real? {t}) (list (round {t}) (exact->inexact {t}) (inexact->exact (round (* 1.0 {t})))) {t}))"), vec![a]) }
+            28 => { let a = self.lib_int(d); let b = self.lib_int(d); let op = *self.rng.pick(&["bitwise-bit-set?", "gcd", "lcm", "modulo", "remainder"]); E::node(Ty::Val, "lib-num", &format!("({op} $0 $1)"), vec![a, b]) }
+            _ => { let a = self.lib_num(d); let op = *self.rng.pick(&["exact-integer?", "nan?*", "zero?", "positive?", "even?", "real?", "complex?", "flonum?", "single-flonum?"]); E::node(Ty::Val, "lib-num", &format!("({op} $0)"), vec![a]) }
+        }
+    }
+
+    fn lib_strop(&mut self, d: usize) -> E {
+        let t = self.fresh("t");
+        match self.rng.below(22) {
+            0 | 1 => { let s = self.lib_str(d); let op = *self.rng.pick(&["string-upcase", "string-downcase", "string-foldcase", "string-titlecase", "string-normalize-nfd", "string-normalize-nfc", "string-normalize-nfkc", "string-normalize-nfkd"]); E::node(Ty::Val, "lib-string", &format!("({op} $0)"), vec![s]) }
+            2 => { let a = self.lib_str(d); let b = self.lib_str(d); let op = *self.rng.pick(&["string<?", "string=?", "string-ci=?", "string-ci<?", "string>=?", "string-ci>?"]); E::node(Ty::Val, "lib-string", &format!("({op} $0 $1)"), vec![a, b]) }
+            3 => { let a = self.lib_str(d); let b = self.lib_str(d); E::node(Ty::Val, "lib-string", "(string-append $0 $1)", vec![a, b]) }
+            4 => { let s = self.lib_str(d); let i = self.lib_int(d); let j = self.lib_int(d); E::node(Ty::Val, "lib-string", &format!("(let* ([{t} $0] [n (string-length {t})] [i (modulo $1 (add1 n))]) (substring {t} i (max i (modulo $2 (add1 n)))))"), vec![s, i, j]) }
+            5 => { let s = self.lib_str(d); E::node(Ty::Val, "lib-string", "(string->list $0)", vec![s]) }
+            6 => { let a = self.lib_char(d); let b = self.lib_char(d); E::node(Ty::Val, "lib-string", "(list->string (list $0 $1 $0))", vec![a, b]) }
+            7 => { let s = self.lib_str(d); E::node(Ty::Val, "lib-bytes", "(string->bytes/utf-8 $0)", vec![s]) }
+            8 => { let b = self.lib_lit(BYTES_POOL); let op = *self.rng.pick(&["(bytes->string/utf-8 $0 #\\?)", "(bytes->string/latin-1 $0)", "(bytes->string/utf-8 $0)", "(bytes->list $0)", "(bytes-length $0)", "(bytes-utf-8-length $0 #\\?)", "(bytes->string/locale $0 #\\?)"]); E::node(Ty::Val, "lib-bytes", op, vec![b]) }
+            9 => { let s = self.lib_str(d); let op = *self.rng.pick(&["(string->bytes/latin-1 $0 63)", "(string-utf-8-length $0)", "(bytes-append (string->bytes/utf-8 $0) #\"\\0\")", "(string->immutable-string $0)", "(string-copy $0)"]); E::node(Ty::Val, "lib-bytes", op, vec![s]) }
+            10 => { let c = self.lib_char(d); let op = *self.rng.pick(&["char-upcase", "char-downcase", "char-foldcase", "char-titlecase", "char->integer", "char-general-category", "char-alphabetic?", "char-numeric?", "char-whitespace?", "char-upper-case?", "char-title-case?", "char-symbolic?", "char-punctuation?", "char-graphic?", "char-blank?", "char-iso-control?", "char-extended-pictographic?"]); E::node(Ty::Val, "lib-char", &format!("({op} $0)"), vec![c]) }
+            11 => { let a = self.lib_char(d); let b = self.lib_char(d); let op = *self.rng.pick(&["char<?", "char-ci=?", "char-ci<?", "char=?"]); E::node(Ty::Val, "lib-char", &format!("({op} $0 $1)"), vec![a, b]) }
+            12 => { let s = self.lib_str(d); let op = *self.rng.pick(&["string->symbol", "string->uninterned-symbol", "string->keyword", "string->unreadable-symbol"]); let w = if op == "string->keyword" { "(keyword->string ($op $0))" } else { "(symbol->string ($op $0))" }; E::node(Ty::Val, "lib-symbol", &w.replace("$op", op), vec![s]) }
+            13 => { let a = self.lib_str(d); let b = self.lib_str(d); let op = *self.rng.pick(&["(symbol<? (string->symbol $0) (string->symbol $1))", "(keyword<? (string->keyword $0) (string->keyword $1))", "(eq? (string->symbol $0) (string->symbol $1))", "(equal? $0 $1)"]); E::node(Ty::Val, "lib-symbol", op, vec![a, b]) }
+            14 => { let i = self.lib_int(d); let c = self.lib_char(d); E::node(Ty::Val, "lib-string", "(make-string (modulo $0 5) $1)", vec![i, c]) }
+            15 | 16 => { let rx = self.lib_lit(RX_POOL); let s = self.lib_str(d); let op = *self.rng.pick(&["(regexp-match $0 $1)", "(regexp-match-positions $0 $1)", "(regexp-match* $0 $1)", "(regexp-split $0 $1)", "(regexp-replace $0 $1 \"<\\\\0>\")", "(regexp-replace* $0 $1 \"_\")", "(regexp-match? $0 $1)", "(regexp-match-positions* $0 $1)"]); E::node(Ty::Val, "lib-regexp", op, vec![rx, s]) }
+            17 => { let v = self.lib_any(d); let op = *self.rng.pick(&["write", "display", "print"]); E::node(Ty::Val, "lib-print", &format!("(let ([o (open-output-string)]) ({op} $0 o) (get-output-string o))"), vec![v]) }
+            18 => { let a = self.lib_any(d); let b = self.lib_any(d); let f = *self.rng.pick(&["\"~a|~s\"", "\"~v ~e\"", "\"~s~n~a\"", "\"~.3a/~s\""]); E::node(Ty::Val, "lib-print", &format!("(format {f} $0 $1)"), vec![a, b]) }
+            19 => { let v = self.lib_any(d); E::node(Ty::Val, "lib-print", &format!("(let ([{t} $0]) (let ([r (read (open-input-string (format \"~s\" {t})))]) (list r (equal? r {t}))))"), vec![v]) }
+            20 => { let s = self.lib_str(d); E::node(Ty::Val, "lib-print", &format!("(with-handlers ([exn:fail:read? (lambda (e) 'read-error)]) (let ([p (open-input-string $0)]) (let loop ([n 0] [acc '()]) (let ([{t} (read p)]) (if (or (eof-object? {t}) (fx> n 4)) (reverse acc) (loop (fx+ n 1) (cons {t} acc)))))))"), vec![s]) }
+            _ => { let n = self.lib_num(d); E::node(Ty::Val, "lib-string", "(string-length (number->string $0))", vec![n]) }
+        }
+    }
+
+    /// Lists, sorting, hash tables.
+    fn lib_collop(&mut self, d: usize) -> E {
+        let h = self.fresh("h");
+        match self.rng.below(10) {
+            0 | 1 => { let l = self.lib_numlist(d); let op: &str = self.rng.pick(&["(sort (filter real? $0) <)", "(sort (filter real? $0) >=)", "(sort (map number->string $0) string<?)", "(foldl cons '() $0)", "(map (lambda (x) (* x x)) $0)", "(assv 1/3 (map (lambda (x) (cons x x)) $0))", "(member 2.0 $0)", "(memv 0 $0)", "(list-tail $0 1)", "(filter exact? $0)", "(foldr (lambda (x a) (+ x a)) 0 $0)", "(remove 1/3 $0)"]); E::node(Ty::Val, "lib-list", &op, vec![l]) }
+            2 => { let a = self.lib_str(d); let b = self.lib_str(d); let c = self.lib_str(d); E::node(Ty::Val, "lib-list", "(sort (list $0 $1 $2) string-ci<?)", vec![a, b, c]) }
+            3 | 4 | 5 => {
+                let mk = *self.rng.pick(&["make-hash", "make-hasheqv", "make-hash", "make-hashalw", "make-hasheq"]);
+                let mk = if mk == "make-hasheq" { "make-hash" } else { mk };
+                let k1 = self.lib_any(d); let v1 = self.lib_any(d); let k2 = self.lib_any(d); let k3 = self.lib_any(d);
+                E::node(Ty::Val, "lib-hash", &format!("(let ([{h} ({mk})]) (hash-set! {h} $0 $1) (hash-set! {h} $2 'two) (hash-update! {h} $0 (lambda (x) (list x)) 'none) (list (hash-ref {h} $3 'none) (hash-ref {h} $0 #f) (hash-count {h}) (begin (hash-remove! {h} $2) (hash-count {h}))))"), vec![k1, v1, k2, k3])
+            }
+            6 | 7 => {
+                let mk = *self.rng.pick(&["(hash)", "(hasheqv)", "(hashalw)"]);
+                let k1 = self.lib_any(d); let k2 = self.lib_any(d); let k3 = self.lib_any(d);
+                E::node(Ty::Val, "lib-hash", &format!("(let* ([{h} (hash-set (hash-set {mk} $0 1) $1 2)] [r (hash-remove {h} $2)]) (list (hash-count {h}) (hash-count r) (hash-ref r $0 'none) (equal? {h} (hash-set (hash-set {mk} $1 2) $0 1)) (hash-has-key? r $1)))"), vec![k1, k2, k3])
+            }
+            8 => { let a = self.lib_any(d); let b = self.lib_any(d); E::node(Ty::Val, "lib-list", "(let ([v (vector $0 $1 $0)]) (vector-fill! v $1) (list (vector->list v) (vector->immutable-vector v) (equal? v (vector $1 $1 $1))))", vec![a, b]) }
+            _ => { let a = self.lib_any(d); let b = self.lib_any(d); E::node(Ty::Val, "lib-list", "(list (equal? $0 $1) (equal? (list $0) (list $1)) (eqv? $0 $0))", vec![a, b]) }
+        }
+    }
+
+    /// Any library value (also plain Val expressions).
+    fn lib_any(&mut self, d: usize) -> E {
+        if d == 0 {
+            let p = *self.rng.pick(&[NUM_POOL, STR_POOL, CHAR_POOL, BYTES_POOL, VAL_POOL]);
+            return self.lib_lit(p);
+        }
+        match self.rng.below(8) {
+            0 | 1 => self.lib_num(d),
+            2 | 3 => self.lib_str(d),
+            4 => self.lib_char(d),
+            5 => self.lib_lit(BYTES_POOL),
+            6 => self.expr(Ty::Val, d - 1),
+            _ => self.lib_collop(d - 1),
+        }
+    }
+
+    pub fn lib_op(&mut self, d: usize) -> E {
+        let d = d.max(1);
+        match self.rng.below(10) {
+            0..=3 => self.lib_numop(d - 1),
+            4..=7 => self.lib_strop(d - 1),
+            _ => self.lib_collop(d - 1),
+        }
+    }
+
+    /// A library result used as an Int, Fl or Bool.
+    pub fn lib_typed(&mut self, ty: Ty, d: usize) -> E {
+        let v = self.lib_op(d);
+        let t = self.fresh("t");
+        match ty {
+            Ty::Int => E::node(Ty::Int, "lib-typed", &format!("(let ([{t} $0]) (cond [(exact-integer? {t}) {t}] [(and (rational? {t}) (exact? {t})) (numerator {t})] [(string? {t}) (string-length {t})] [(bytes? {t}) (bytes-length {t})] [(char? {t}) (char->integer {t})] [(list? {t}) (length {t})] [(boolean? {t}) (if {t} 1 0)] [else -1]))"), vec![v]),
+            Ty::Fl => E::node(Ty::Fl, "lib-typed", &format!("(let ([{t} $0]) (if (real? {t}) (real->double-flonum {t}) (if (number? {t}) (real->double-flonum (real-part {t})) 0.5)))"), vec![v]),
+            _ => E::node(Ty::Bool, "lib-typed", &format!("(let ([{t} $0]) (and {t} (not (null? {t})) #t))"), vec![v]),
+        }
+    }
 }

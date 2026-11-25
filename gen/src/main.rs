@@ -114,6 +114,11 @@ struct Pair {
     /// starts a background place there, so it is kept apart from `c`),
     /// started on first use
     e: Option<Server>,
+    /// released Racket 9.3 (variant `ref93`, second reference): racket and
+    /// runner compiled by it, copied into the build dir by build.sh; started
+    /// on first use
+    f: Option<Server>,
+    ref93: Option<(PathBuf, PathBuf)>,
     restarts: u64,
 }
 
@@ -124,7 +129,7 @@ struct Pair {
 /// PLT_CS_COMPILE_LIMIT=10) with variant `none`.
 const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
                             "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub",
-                            "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit"];
+                            "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit", "ref93"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -138,7 +143,13 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "opaque", "opaquesplit", "opaquesplit", "opaquesplit", "opaquesplit",
                                 "ctlnoise", "ctlnoise", "ctlsplit", "ctlsplit",
                                 "gc", "gc", "gc", "gc", "gc", "gczo", "gczo", "gczo", "gczo",
-                                "gcsplit", "gcsplit", "gcsplit", "gcsplit", "gcsplit"];
+                                "gcsplit", "gcsplit", "gcsplit", "gcsplit", "gcsplit",
+                                "ref93", "ref93", "ref93", "ref93", "ref93", "ref93", "ref93", "ref93",
+                                "ref93", "ref93", "ref93", "ref93", "ref93", "ref93"];
+
+/// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
+/// in 9.3: a case using one is not sent to the 9.3 server.
+const NEW_SINCE_93: &[&str] = &["flhypot", "fllog1p", "flexpm1", "flcbrt", "flerf", "flgamma", "fllgamma"];
 
 /// `#:unsafe` is only specified when the safe run raises no exn:fail:contract
 /// (syntax.scrbl).  Conservative: the safe machine-code run finished `ok`
@@ -152,11 +163,32 @@ fn unsafe_eligible(a: &Res) -> bool {
 }
 
 impl Pair {
-    fn new(racket: PathBuf, runner: PathBuf) -> Pair {
+    fn new(racket: PathBuf, runner: PathBuf, ref93: Option<(PathBuf, PathBuf)>) -> Pair {
         let a = spawn_server(&racket, &runner, false);
         let b = spawn_server(&racket, &runner, true);
         let c = spawn_server(&racket, &runner, false);
-        Pair { racket, runner, a, b, c, d: None, e: None, restarts: 0 }
+        Pair { racket, runner, a, b, c, d: None, e: None, f: None, ref93, restarts: 0 }
+    }
+    /// The 9.3 run for variant `ref93`, sent after a's: None when 9.3 is not
+    /// installed or the program uses a name 9.3 lacks.
+    fn query93(&mut self, prog: &str, lim: Duration) -> Option<Res> {
+        let (r93, run93) = self.ref93.clone()?;
+        if NEW_SINCE_93.iter().any(|n| prog.contains(n)) {
+            return None;
+        }
+        if self.f.is_none() {
+            self.f = Some(spawn_server(&r93, &run93, false));
+        }
+        let fv = self.f.as_mut().unwrap();
+        let sf = Self::send(fv, prog);
+        let rf = Self::recv(fv, sf, lim);
+        if !matches!(rf, Res::Line(_)) {
+            let _ = fv.child.kill();
+            let _ = fv.child.wait();
+            self.f = None;
+            self.restarts += 1;
+        }
+        Some(rf)
     }
     fn send(s: &mut Server, prog: &str) -> bool {
         Self::send_v(s, prog, "none")
@@ -189,6 +221,13 @@ impl Pair {
         // server).  b (interpreter) is the slow one anyway.
         let sa = Self::send(&mut self.a, prog);
         let sb = Self::send(&mut self.b, prog);
+        if variant == "ref93" {
+            let rf = self.query93(prog, lim);
+            let ra = Self::recv(&mut self.a, sa, lim);
+            let rb = Self::recv(&mut self.b, sb, lim);
+            self.restart_ab(&ra, &rb);
+            return (ra, rb, rf);
+        }
         // safe variants run in parallel with a
         let jit = variant == "jitify";
         if jit && self.d.is_none() {
@@ -218,6 +257,10 @@ impl Pair {
             None
         };
         let rb = Self::recv(&mut self.b, sb, lim);
+        self.restart_ab(&ra, &rb);
+        (ra, rb, rc)
+    }
+    fn restart_ab(&mut self, ra: &Res, rb: &Res) {
         if !matches!(ra, Res::Line(_)) {
             let _ = self.a.child.kill();
             let _ = self.a.child.wait();
@@ -230,7 +273,6 @@ impl Pair {
             self.b = spawn_server(&self.racket, &self.runner, true);
             self.restarts += 1;
         }
-        (ra, rb, rc)
     }
     fn close(mut self) {
         drop(self.a.stdin);
@@ -238,9 +280,11 @@ impl Pair {
         drop(self.c.stdin);
         let mut d = self.d.take().map(|d| { drop(d.stdin); d.child });
         let mut e = self.e.take().map(|e| { drop(e.stdin); e.child });
+        let mut f = self.f.take().map(|f| { drop(f.stdin); f.child });
         let mut children = vec![&mut self.a.child, &mut self.b.child, &mut self.c.child];
         if let Some(dc) = d.as_mut() { children.push(dc); }
         if let Some(ec) = e.as_mut() { children.push(ec); }
+        if let Some(fc) = f.as_mut() { children.push(fc); }
         for c in children {
             let t = Instant::now();
             loop {
@@ -326,8 +370,11 @@ fn classify(a: &Res, b: &Res) -> Verdict {
 /// toggle (c).  Toggles must not change results (compiler.scrbl /
 /// eval.scrbl: context preservation only affects stack traces; unsafe only
 /// where exn:fail:contract would be raised, excluded by eligibility).
-fn classify_variant(a: &Res, c: &Option<Res>, variant: &'static str) -> Verdict {
+fn classify_variant(a: &Res, c: &Option<Res>, variant: &'static str, prog: &str) -> Verdict {
     let Some(c) = c else { return Verdict::Pass };
+    if variant == "ref93" {
+        return classify_ref93(a, c, prog);
+    }
     let la = match a {
         Res::Line(l) if kind_of(l) != "timeout" && kind_of(l) != "oom" => l,
         _ => return Verdict::Pass,
@@ -364,13 +411,114 @@ fn classify_variant(a: &Res, c: &Option<Res>, variant: &'static str) -> Verdict 
     Verdict::Fail(variant, "value")
 }
 
+/// Error messages inside the printed output of a result line, `(exn KIND
+/// "message")` as written by `show` (in the line's `write`n output field:
+/// `(exn KIND \"message\")`), reduced to `(exn KIND)`.
+fn strip_msgs(f: &str) -> String {
+    let b: Vec<char> = f.chars().collect();
+    let mut o = String::new();
+    let mut i = 0;
+    let pat: Vec<char> = "(exn ".chars().collect();
+    while i < b.len() {
+        if b[i..].starts_with(&pat) {
+            // kind word, then ` \"`
+            let mut j = i + pat.len();
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == '-') {
+                j += 1;
+            }
+            if j + 2 < b.len() && b[j] == ' ' && b[j + 1] == '\\' && b[j + 2] == '"' {
+                // decode written-form escapes (\\ -> \, \" -> ") into the
+                // original text; the message ends at an unescaped original quote
+                let mut k = j + 3;
+                let mut esc = false;
+                let mut end = None;
+                while k + 1 < b.len() {
+                    let ch = if b[k] == '\\' { k += 2; b[k - 1] } else { k += 1; b[k - 1] };
+                    if esc { esc = false; continue; }
+                    if ch == '\\' { esc = true; continue; }
+                    if ch == '"' { end = Some(k); break; }
+                }
+                if let Some(e) = end {
+                    if e < b.len() && b[e] == ')' {
+                        o.extend(b[i..j].iter());
+                        o.push(')');
+                        i = e + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        o.push(b[i]);
+        i += 1;
+    }
+    o
+}
+
+/// ref93 comparison form of a result line: message texts dropped (wording
+/// changes between releases are not bugs; the exn struct type and the kind
+/// printed by `show` stay), and when the program uses min/max the sign of
+/// zero ignored (trunk 05afec9201: flmax returns its second argument for
+/// 0.0 and -0.0, documented change).
+fn norm93(l: &str, prog: &str) -> String {
+    let mut f: Vec<String> = l.split('\t').map(strip_msgs).collect();
+    if f.first().map(|s| s.as_str()) == Some("exn") {
+        f.truncate(3);
+    }
+    let mut s = f.join("\t");
+    if ["flmax", "flmin", "(max ", "(min "].iter().any(|p| prog.contains(p)) {
+        s = s.replace("-0.0", "0.0");
+    }
+    s
+}
+
+/// Second reference: trunk machine code (a) vs released Racket 9.3 machine
+/// code on the same module (c).  Only reached when trunk machine code and
+/// trunk interpreter agree (classify_all), so a difference is in code both
+/// trunk modes share (rumble/Chez library compiled by the changed compiler,
+/// schemify, expander, io) or a documented change since 9.3 (triage against
+/// `git log v9.3..`).  9.3 crashes/hangs are 9.3's own problems: skipped.
+fn classify_ref93(a: &Res, c: &Res, prog: &str) -> Verdict {
+    let la = match a {
+        Res::Line(l) if kind_of(l) != "timeout" && kind_of(l) != "oom" => l,
+        _ => return Verdict::Pass,
+    };
+    let lc = match c {
+        Res::Line(l) if kind_of(l) != "timeout" && kind_of(l) != "oom" => l,
+        _ => return Verdict::Skip("ref93_noresult"),
+    };
+    if lc.contains("unbound identifier") || lc.contains("exn:fail:syntax") {
+        return Verdict::Skip("ref93_unbound");
+    }
+    if INTERNAL.iter().any(|p| lc.contains(p)) {
+        return Verdict::Skip("ref93_internal");
+    }
+    let (na, nc) = (norm93(la, prog), norm93(lc, prog));
+    if na == nc {
+        return Verdict::Pass;
+    }
+    // 9.3 bug fixed in trunk (patch 003 / Chez unboxed flonum box allocated
+    // before a continuation capture, also in 9.3): not comparable.
+    if prog.contains("call-with-composable-continuation") || prog.contains("call/cc") || prog.contains("call-with-current-continuation") {
+        return Verdict::Skip("ref93_continuation");
+    }
+    if kind_of(la) != kind_of(lc) || (kind_of(la) == "exn" && na.split('\t').nth(2) != nc.split('\t').nth(2)) {
+        return Verdict::Fail("ref93", "error");
+    }
+    Verdict::Fail("ref93", "value")
+}
+
 /// Both oracles; machine-vs-interpreter first (its signatures unchanged).
-fn classify_all(a: &Res, b: &Res, c: &Option<Res>, variant: &'static str) -> Verdict {
+fn classify_all(a: &Res, b: &Res, c: &Option<Res>, variant: &'static str, prog: &str) -> Verdict {
     let v1 = classify(a, b);
     if matches!(v1, Verdict::Fail(..)) {
         return v1;
     }
-    match classify_variant(a, c, variant) {
+    if variant == "ref93" && a != b {
+        // not comparable (interp timeout etc.): the 9.3 comparison needs
+        // both trunk modes to agree
+        return v1;
+    }
+    match classify_variant(a, c, variant, prog) {
         Verdict::Pass => v1,
         v2 @ Verdict::Fail(..) => v2,
         Verdict::Skip(r) => if v1 == Verdict::Pass { Verdict::Skip(r) } else { v1 },
@@ -381,7 +529,9 @@ const PRIORITY: &[&str] = &[
     "composable", "reentry", "marks-tag", "prompt", "escape", "dynamic-wind", "wcm", "parameterize", "handlers", "closure-set", "unused-fn",
     "letrec-loop", "fl-loop", "for-fold", "for-sum", "values", "struct-mutate", "struct",
     "vector-mutate", "vector", "flvector", "hash", "type-dispatch", "type-guard", "pair-guard",
-    "case-any", "box", "vector-any", "list-op", "if-mixed", "char", "symbol", "type-pred", "equal", "pair", "flbit-field", "flround", "flmin-max", "fl->int",
+    "case-any", "box", "vector-any", "list-op", "if-mixed", "char", "symbol", "type-pred", "equal", "pair", 
+    "lib-hash", "lib-regexp", "lib-print", "lib-numstr", "lib-bytes", "lib-symbol", "lib-char", "lib-string", "lib-list", "lib-cmp", "lib-num", "lib-typed",
+    "flbit-field", "flround", "flmin-max", "fl->int",
     "int->fl", "fixnum-shift", "fixnum", "shift", "flonum", "generic-fl", "fl-compare", "fx-compare",
     "case", "cond", "if", "set", "lambda-app", "internal-define", "let", "call", "tap", "list",
     "string", "fl-predicate", "predicate", "compare", "generic-arith", "logic", "begin",
@@ -515,6 +665,59 @@ case $KIND in
 esac
 "#;
 
+const REPRO_REF93: &str = r##"#!/usr/bin/env bash
+# Repro for signature @SIG@ (oracle ref93, kind @KIND@).
+# Runs prog.rkt through runner.rkt with the build's racket (machine code and
+# interpreter, which must agree) and with released Racket 9.3 (the build's
+# ref93/ copy, see build.sh); compares trunk machine code with 9.3 after
+# dropping error-message texts (and the sign of zero when min/max is used),
+# as rktgen's norm93 does.
+# exit 1: failure reproduces; 0: it does not; 2: cannot decide.
+B=$(cd "$1" 2>/dev/null && pwd) || exit 2
+R="$B/src/racket/bin/racket"
+R93="$B/ref93/racket/bin/racket"
+[ -x "$R" ] && [ -x "$R93" ] || exit 2
+cd "$(dirname "$0")"
+res() { printf '%s\n' "$1" | grep -E $'^(ok|exn|raise|timeout|oom)\t|^oom$' | tail -1; }
+a=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=20 timeout -k 5 120 "$R" runner.rkt file prog.rkt none 2>&1)
+b=$(env -u PLT_CS_COMPILE_LIMIT PLT_CS_INTERP=1 RKT_CASE_TIMEOUT=120 timeout -k 5 300 "$R" runner.rkt file prog.rkt none 2>&1)
+c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R93" runner.rkt file prog.rkt none 2>&1)
+ra=$(res "$a"); rb=$(res "$b"); rc=$(res "$c")
+[ -z "$ra" ] || [ -z "$rb" ] || [ -z "$rc" ] && exit 2
+case "$ra$rb$rc" in *timeout*|*oom*) exit 2;; esac
+[ "$ra" != "$rb" ] && exit 0
+case "$rc" in *"unbound identifier"*|*exn:fail:syntax*) exit 2;; esac
+RA="$ra" RC="$rc" python3 -I -c '
+import os, sys
+prog = open("prog.rkt", encoding="utf-8").read()
+def strip(f):
+    o = []; i = 0; n = len(f)
+    while i < n:
+        if f.startswith("(exn ", i):
+            j = i + 5
+            while j < n and (f[j].isascii() and (f[j].isalnum() or f[j] == "-")): j += 1
+            if j + 2 < n and f[j] == " " and f[j+1] == "\\" and f[j+2] == "\"":
+                k = j + 3; esc = False; end = None
+                while k + 1 < n:
+                    if f[k] == "\\": k += 2; ch = f[k-1]
+                    else: k += 1; ch = f[k-1]
+                    if esc: esc = False; continue
+                    if ch == "\\": esc = True; continue
+                    if ch == "\"": end = k; break
+                if end is not None and end < n and f[end] == ")":
+                    o.append(f[i:j]); o.append(")"); i = end + 1; continue
+        o.append(f[i]); i += 1
+    return "".join(o)
+def norm(l):
+    f = [strip(x) for x in l.split("\t")]
+    if f[0] == "exn": f = f[:3]
+    s = "\t".join(f)
+    if any(p in prog for p in ("flmax", "flmin", "(max ", "(min ")): s = s.replace("-0.0", "0.0")
+    return s
+sys.exit(1 if norm(os.environ["RA"]) != norm(os.environ["RC"]) else 0)
+'
+"##;
+
 struct Search {
     out: PathBuf,
     runner_src: PathBuf,
@@ -542,7 +745,10 @@ impl Search {
         std::fs::write(dir.join("prog.rkt"), &prog).unwrap();
         std::fs::copy(&self.runner_src, dir.join("runner.rkt")).unwrap();
         let is_variant = VARIANTS.contains(&oracle);
-        let msg = if is_variant {
+        let msg = if oracle == "ref93" {
+            let c = rc.as_ref().map(res_text).unwrap_or_else(|| "(not run)".into());
+            format!("trunk machine-code (= trunk interpreter): {}\nracket 9.3 machine-code: {}", res_text(ra), c)
+        } else if is_variant {
             let c = rc.as_ref().map(res_text).unwrap_or_else(|| "(not run)".into());
             format!("machine-code: {}\nmachine-code, variant {oracle}: {}", res_text(ra), c)
         } else {
@@ -557,7 +763,7 @@ impl Search {
             json_str(seed_label)
         );
         std::fs::write(dir.join("finding.json"), fj).unwrap();
-        let rs = (if is_variant { REPRO_VARIANT } else { REPRO }).replace("@SIG@", &sig).replace("@ORACLE@", oracle).replace("@KIND@", kind);
+        let rs = (if oracle == "ref93" { REPRO_REF93 } else if is_variant { REPRO_VARIANT } else { REPRO }).replace("@SIG@", &sig).replace("@ORACLE@", oracle).replace("@KIND@", kind);
         let rp = dir.join("repro.sh");
         std::fs::write(&rp, rs).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -626,6 +832,13 @@ fn main() {
                 println!(";; case {seed}:{i}\n{}", render_program(&p.0));
             }
         }
+        Some("norm93") => {
+            // rktgen norm93 <prog.rkt>: result lines on stdin -> ref93 comparison form
+            let prog = std::fs::read_to_string(&args[2]).unwrap();
+            for l in std::io::stdin().lock().lines() {
+                println!("{}", norm93(&l.unwrap(), &prog));
+            }
+        }
         Some("run") => {
             let build = PathBuf::from(&args[2]);
             let seed: u64 = args[3].parse().unwrap();
@@ -636,7 +849,10 @@ fn main() {
             let runner = build.join("harness/runner.rkt");
             let t0 = Instant::now();
             let deadline = t0 + Duration::from_secs(secs);
-            let pair = RefCell::new(Pair::new(racket, runner.clone()));
+            let r93 = build.join("ref93/racket/bin/racket");
+            let run93 = build.join("harness93/runner.rkt");
+            let ref93 = if r93.exists() && run93.exists() { Some((r93, run93)) } else { None };
+            let pair = RefCell::new(Pair::new(racket, runner.clone(), ref93));
             let last: RefCell<Option<Last>> = RefCell::new(None);
             let variant: std::cell::Cell<&'static str> = std::cell::Cell::new(VARIANTS[0]);
             let mut search = Search { out: out.clone(), runner_src: runner, per_sig: HashMap::new(), shrinks_per_kind: HashMap::new() };
@@ -646,8 +862,9 @@ fn main() {
             write_stats(&out, 0, 0, &extra, 0.0);
             let property = |p: Program| -> TestResult {
                 let var = variant.get();
-                let (a, b, c) = pair.borrow_mut().query(&render_program(&p.0), var);
-                let v = classify_all(&a, &b, &c, var);
+                let text = render_program(&p.0);
+                let (a, b, c) = pair.borrow_mut().query(&text, var);
+                let v = classify_all(&a, &b, &c, var, &text);
                 let detail = format!("machine={} interp={} variant {var}={}", res_text(&a), res_text(&b),
                                      c.as_ref().map(res_text).unwrap_or_default());
                 *last.borrow_mut() = Some(Last { verdict: v.clone(), a, b, c });
@@ -740,8 +957,9 @@ fn main() {
                     };
                     if *n <= 40 {
                         let var = variant.get();
-                        let (ra, rb, rc) = pair.borrow_mut().query(&render_program(&small.0), var);
-                        let (ra, rb, rc) = if classify_all(&ra, &rb, &rc, var) == v { (ra, rb, rc) } else { (a, b, c) };
+                        let text = render_program(&small.0);
+                        let (ra, rb, rc) = pair.borrow_mut().query(&text, var);
+                        let (ra, rb, rc) = if classify_all(&ra, &rb, &rc, var, &text) == v { (ra, rb, rc) } else { (a, b, c) };
                         search.record(&small, &v, &format!("{seg_seed}:{iter}"), &ra, &rb, &rc);
                     }
                 }
