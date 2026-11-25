@@ -9,6 +9,9 @@ SRC=$(cd "$1" && pwd)
 mkdir -p "$2"
 BUILD=$(cd "$2" && pwd)
 MODE=${3:-}
+# Parallelism and the LLVM tools for coverage builds; override in the environment.
+CPUS=${CPUS:-16}
+JOBS=${JOBS:-$CPUS}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 mkdir -p "$BUILD/src"
@@ -18,7 +21,7 @@ rsync -a --exclude=.git "$SRC"/ "$BUILD/src"/
 
 cd "$BUILD/src"
 if [ "$MODE" = coverage ]; then
-  LLVM_BIN=/usr/lib/llvm-21/bin
+  LLVM_BIN=${LLVM_BIN:-/usr/lib/llvm-21/bin}
   export CC="$LLVM_BIN/clang"
   # The build happens in a copy; map its paths back to the tree we were given
   # so the coverage map names the tree's sources.
@@ -33,7 +36,7 @@ STAMP="$BUILD/cflags.stamp"
 if [ "$(cat "$STAMP" 2>/dev/null)" != "${CC:-}|${CFLAGS:-}" ]; then
   [ -e "$STAMP" ] && rm -rf "$BUILD/src/racket/src/build"
 fi
-make base CPUS=16 JOBS=16 PKGS=racket-lib > "$BUILD/make.log" 2>&1 || {
+make base CPUS=$CPUS JOBS=$JOBS PKGS=racket-lib > "$BUILD/make.log" 2>&1 || {
   tail -40 "$BUILD/make.log"; exit 1; }
 echo "${CC:-}|${CFLAGS:-}" > "$STAMP"
 RACKET="$BUILD/src/racket/bin/racket"

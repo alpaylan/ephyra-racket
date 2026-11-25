@@ -11,6 +11,8 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "ephyra"
 version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd1a1caa1aec3df700ce0d4d791f725cbea8db09c6df739f1768c84bf3f44d67"
 dependencies = [
  "ephyra-macros",
  "rand_chacha",
@@ -22,6 +24,8 @@ dependencies = [
 [[package]]
 name = "ephyra-macros"
 version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f9ccd9870afa5da6d9450ec5d7a1f5815cc4ef27c06b12cb8e0726796d5c9f9"
 dependencies = [
  "proc-macro2",
  "quote",

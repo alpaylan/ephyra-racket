@@ -1,2 +1,5 @@
 gen/target/
 racket/compiled/
+gen/.ephyra/
+build/
+out/

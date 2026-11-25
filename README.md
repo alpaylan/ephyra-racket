@@ -1,17 +1,61 @@
-# Racket CS harness: machine code vs interpreter
+# ephyra-racket: property-based differential testing of Racket CS
 
-Layout:
+A harness that generates well-formed Racket modules and checks that Racket CS gives the same
+result when the same module is run in ways that must agree: machine code vs. the interpreter
+(`PLT_CS_INTERP=1`), optimizer toggles, `.zo` round trips, splitting a module into two (cross-module
+inlining), rewriting it through hygienic macros, GC stress, and more. Programs are generated and shrunk
+with [Ephyra](https://github.com/datadog-labs/ephyra), a property-based testing library for Rust.
 
-- `build.sh <src> <build> [coverage]`: copies the tree to `<build>/src` (the Racket build writes inside
-  its tree; rsync keeps mtimes so rebuilds are incremental), runs `make base CPUS=16 JOBS=16
-  PKGS=racket-lib` there, builds the generator with cargo into `<build>/harness-target`, copies
-  `racket/runner.rkt` to `<build>/harness/` and compiles it to a `.zo`.
-- `run.sh <build> <seed> <seconds> <out>`: runs `<build>/harness-target/release/rktgen run ...`.
-- `gen/` (Rust, ephyra): `src/gen.rs` is the program generator (`ProgramGen`, an `ephyra::Gen` with a
+The generator and oracles were written by an automated agent loop driving Ephyra, seeded with the
+oracle ideas of [racket-fuzz](https://github.com/samth/racket-fuzz) (no code is shared with it).
+
+## Bugs found
+
+- [racket/racket#5688](https://github.com/racket/racket/issues/5688): schemify: inlined function loses
+  `set!` of a `let`-bound copy of its argument
+- [racket/racket#5689](https://github.com/racket/racket/issues/5689): schemify: cross-module inlining
+  loses `set!` of the inlined function's argument
+- [racket/racket#5690](https://github.com/racket/racket/issues/5690): re-entering a continuation
+  captured inside `fl+` mutates the flonum returned the first time
+
+## Quick start
+
+Requirements: Rust (`cargo`), a C toolchain, `make`, `rsync`, and network access once (the Racket
+build fetches its portable-bytecode boot files). Linux x86_64 is what it has been run on.
+
+```
+git clone https://github.com/racket/racket
+./build.sh racket build          # minimal Racket CS in build/src, the generator in build/harness-target
+./run.sh build 1 600 out         # seed 1, 600 seconds
+cat out/stats.json; ls out/findings
+```
+
+`build.sh <racket-tree> <build-dir> [coverage]` copies the tree to `<build-dir>/src` (the Racket build
+writes inside its tree; rsync keeps mtimes, so rebuilds are incremental), runs
+`make base PKGS=racket-lib` there (`CPUS`/`JOBS`, default 16), builds the generator with cargo, and
+compiles `racket/runner.rkt` to a `.zo`. With `coverage` it builds the C parts with clang source-based
+coverage instead (`LLVM_BIN`, default `/usr/lib/llvm-21/bin`; see Coverage below).
+
+`run.sh <build-dir> <seed> <seconds> <out-dir>` runs one search process. It writes
+`<out-dir>/stats.json` (updated periodically) and, for each failure, after shrinking,
+`<out-dir>/findings/<signature>/<n>/` with `prog.rkt` (the shrunk module), `finding.json` (signature,
+oracle, message, seed), `results.txt` (the two result lines that differ), a copy of `runner.rkt`,
+and `repro.sh`: `./repro.sh <build-dir>` re-runs the
+case in both configurations and exits 1 if they still differ, 0 if not, 2 if it cannot tell. At most 3
+findings are kept per signature. Several `run.sh` processes with different seeds can share one build.
+
+`gen/target/release/rktgen sample <seed> [n]` (after `cargo build --release` in `gen/`) prints generated
+programs without running anything.
+
+## Layout
+
+- `gen/` (Rust, Ephyra): `src/gen.rs` is the program generator (`ProgramGen`, an `ephyra::Gen` with a
   scope-aware shrinker; `#[ephyra::generator(valid_program, metrics = program_metrics)] programs`),
-  `src/main.rs` the search loop and oracles. `rktgen sample <seed> [n]` prints programs.
+  `src/main.rs` the search loop and oracles.
 - `racket/runner.rkt`: `racket runner.rkt server` reads framed programs (`<nbytes>\n<text>`) and prints
-  one result line each; `racket runner.rkt file prog.rkt` does one (used by `repro.sh`).
+  one result line each; `racket runner.rkt file prog.rkt [variant]` runs one (used by `repro.sh`);
+  `splitdump` and `macrodump` print the rewritten modules of the metamorphic variants.
+- `build.sh`, `run.sh`: above.
 
 ## What is generated
 
@@ -35,7 +79,7 @@ literal pools with edge values (0, -1, fixnum bounds, 2^62, -0.0, +-inf.0, +nan.
 values, all shrink candidates and mutants satisfy `valid_program` (every free name defined earlier).
 Median program 103 nodes / 1.2 KB, median 2 loops, 4 ifs, 3 control forms.
 
-### Delimited control (steering round 5)
+### Delimited control
 
 `Gen::delim` (4% of control choices, taken from `if`): `call-with-continuation-prompt` with fresh
 tags (explicit handler) or the default tag (default handler), `abort-current-continuation` to them,
@@ -47,7 +91,7 @@ and the shape of issue #5658 (a composable continuation captured under a mark, a
 re-applied in a new prompt). Area tags `composable`, `reentry`, `marks-tag`, `prompt` (first in
 PRIORITY).
 
-### Dynamic kind (`Val`, steering round 3)
+### Dynamic kind (`Val`)
 
 Besides the typed int/flonum/boolean expressions, a dynamically typed kind `Val` mixes fixnums,
 bignums, flonums, booleans, pairs/lists, `'()`, strings, chars, symbols, vectors, boxes and void
@@ -116,7 +160,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `racket runner.rkt splitdump prog.rkt` prints the two modules. The split variants get ~half of
      the drawn cases (`VARIANT_DRAW` in main.rs). 30% of generated functions get a small body
      (depth 1-2) so they are under the inlining size limits.
-   - `macro`, `macrozo`, `macrosplit` (metamorphic, steering round 4; runner.rkt `macro-module`,
+   - `macro`, `macrozo`, `macrosplit` (metamorphic, runner.rkt `macro-module`,
      `macro-split`): the generated items are rewritten through hygienic macros defined in the module
      (expander: scope sets, re-represented as sorted lists with a Zobrist hash in f1a34e208d,
      2026-11-16; binding resolution, use-site scopes, serialization of syntax). Each macro expands to
@@ -144,7 +188,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (`local-expand` of the argument to core forms, or with a stop list, then re-expanded).
      `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten
      module(s). They get a third of the drawn cases.
-   - `opaque`, `opaquesplit` (metamorphic, steering round 5; runner.rkt `opaque-module`): selected
+   - `opaque`, `opaquesplit` (metamorphic, runner.rkt `opaque-module`): selected
      sites are wrapped in `(opq-v e)`, `opq-v` a module variable holding the identity that is
      `set!` once, so schemify and Chez cp0/cptypes cannot see through it: literals stop being
      constants, variable references lose known values/types, `(f a ...)` becomes `((opq-v f) a ...)`
@@ -158,9 +202,8 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      expression, `dynamic-wind` with `void` thunks, application of an empty composable continuation
      (rumble control.ss metacontinuation frames, mark splices, winders). `ctlsplit` = split + zo.
      `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten module(s) for all four.
-     The opaque/ctl variants get about a third of the drawn cases (ctlnoise/ctlsplit were only
-     added to the draw table in steering round 6).
-   - `gc`, `gczo`, `gcsplit` (metamorphic, steering round 6; runner.rkt `gc-module`,
+     The opaque/ctl variants get about a third of the drawn cases.
+   - `gc`, `gczo`, `gcsplit` (metamorphic, runner.rkt `gc-module`,
      `set-gc-knobs!`): garbage collection must not change results. They run on a fifth server
      (`e` in main.rs, started on first use) because the runner starts a background place there
      (a second Chez thread with `thread-preserve-ownership!`, rumble place.ss), which makes Chez
@@ -221,7 +264,7 @@ modes against the given build and exits 1/0/2.
 
 ~25 cases/s per run.sh alone (one pair of servers; the interpreter side dominates); ~19.7 cases/s each
 with 6 run.sh in parallel (on a release build and a coverage build, 240 s each: 28 007 cases,
-1 failure). That failure is real and pre-existing (also in 9.3): under `PLT_CS_INTERP=1`,
+1 failure). That failure is real and pre-existing (also in 9.3; racket/racket#5688): under `PLT_CS_INTERP=1`,
 `(define (f a b c) (define w c) (if (begin (set! w w) #t) 0 0)) (f 0 #t 0.0)` raises
 `hash-ref: no value found for key  key: 'w_4` (machine code returns 0).
 
