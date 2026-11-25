@@ -6,6 +6,8 @@
 //! (division by zero, fixnum overflow, fl->fx of NaN) can happen and are
 //! observable, identically, in every compilation mode.
 
+use ephyra::Source;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ty {
     Int,
@@ -20,14 +22,46 @@ pub struct E {
     pub tpl: String,
     pub kids: Vec<E>,
     pub tag: &'static str,
+    /// Names this node binds for its children (unique program-wide).
+    pub binds: Vec<String>,
+    /// Names the template itself references (calls, set! targets, variables).
+    pub uses: Vec<String>,
+    /// Names a top-level item defines for later items.
+    pub defines: Vec<String>,
 }
 
 impl E {
     pub fn atom(ty: Ty, s: &str) -> E {
-        E { ty, tpl: s.to_string(), kids: vec![], tag: "" }
+        E { ty, tpl: s.to_string(), kids: vec![], tag: "", binds: vec![], uses: vec![], defines: vec![] }
+    }
+    pub fn var(ty: Ty, s: &str) -> E {
+        let mut e = E::atom(ty, s);
+        e.uses.push(s.to_string());
+        e
     }
     pub fn node(ty: Ty, tag: &'static str, tpl: &str, kids: Vec<E>) -> E {
-        E { ty, tpl: tpl.to_string(), kids, tag }
+        E { ty, tpl: tpl.to_string(), kids, tag, binds: vec![], uses: vec![], defines: vec![] }
+    }
+    pub fn binding(mut self, names: &[&String]) -> E {
+        self.binds.extend(names.iter().map(|s| s.to_string()));
+        self
+    }
+    pub fn using(mut self, names: &[&String]) -> E {
+        self.uses.extend(names.iter().map(|s| s.to_string()));
+        self
+    }
+    pub fn defining(mut self, names: &[&String]) -> E {
+        self.defines.extend(names.iter().map(|s| s.to_string()));
+        self
+    }
+    /// Free names: used here or below, not bound here or below.
+    pub fn free(&self, out: &mut Vec<String>) {
+        let mut mine: Vec<String> = self.uses.clone();
+        for k in &self.kids {
+            k.free(&mut mine);
+        }
+        mine.retain(|n| !self.binds.contains(n));
+        out.extend(mine);
     }
     pub fn render(&self, out: &mut String) {
         let b = self.tpl.as_bytes();
@@ -46,6 +80,7 @@ impl E {
             }
         }
     }
+    #[allow(dead_code)]
     pub fn size(&self) -> usize {
         1 + self.kids.iter().map(|k| k.size()).sum::<usize>()
     }
@@ -59,26 +94,18 @@ impl E {
     }
 }
 
-pub struct Rng(u64);
-impl Rng {
-    pub fn new(seed: u64) -> Rng {
-        Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
-    }
-    pub fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
+/// Every decision comes from ephyra's `Source`, so ephyra controls seeds,
+/// sizes and replay.
+pub struct Rng<'a>(pub &'a mut Source);
+impl<'a> Rng<'a> {
     pub fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
+        self.0.index(n)
     }
     pub fn chance(&mut self, p: f64) -> bool {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64 <= p
+        self.0.bool_with(p)
     }
-    pub fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
-        &xs[self.below(xs.len())]
+    pub fn pick<'b, T>(&mut self, xs: &'b [T]) -> &'b T {
+        self.0.pick(xs)
     }
 }
 
@@ -101,17 +128,17 @@ struct Fun {
     ret: Ty,
 }
 
-pub struct Gen {
-    pub rng: Rng,
+pub struct Gen<'a> {
+    pub rng: Rng<'a>,
     scope: Vec<(String, Ty, bool)>, // name, type, may set!
     funs: Vec<Fun>,
     next_id: usize,
     loop_depth: usize,
 }
 
-impl Gen {
-    pub fn new(seed: u64) -> Gen {
-        Gen { rng: Rng::new(seed), scope: vec![], funs: vec![], next_id: 0, loop_depth: 0 }
+impl<'a> Gen<'a> {
+    pub fn new(src: &'a mut Source) -> Gen<'a> {
+        Gen { rng: Rng(src), scope: vec![], funs: vec![], next_id: 0, loop_depth: 0 }
     }
     fn fresh(&mut self, p: &str) -> String {
         self.next_id += 1;
@@ -123,7 +150,7 @@ impl Gen {
             None
         } else {
             let n = c[self.rng.below(c.len())].clone();
-            Some(E::atom(ty, &n))
+            Some(E::var(ty, &n))
         }
     }
     fn settable(&mut self, ty: Ty) -> Option<String> {
@@ -322,8 +349,9 @@ impl Gen {
                         &format!("(for/fold ([{acc} $1]) ([{i} (in-range $0)]) $2)"),
                         vec![n, a, body],
                     )
+                    .binding(&[&i, &acc])
                 } else {
-                    E::node(Ty::Int, "for-sum", &format!("(for/sum ([{i} (in-range $0)]) (let ([{acc} $1]) $2))"), vec![n, a, body])
+                    E::node(Ty::Int, "for-sum", &format!("(for/sum ([{i} (in-range $0)]) (let ([{acc} $1]) $2))"), vec![n, a, body]).binding(&[&i, &acc])
                 }
             }
             _ => self.call_or_leaf(Ty::Int, d),
@@ -396,6 +424,7 @@ impl Gen {
                     &format!("(let {lp} ([{i} 0] [{acc} $1]) (if (fx< {i} $0) ({lp} (fx+ {i} 1) $2) {acc}))"),
                     vec![n, a, body],
                 )
+                .binding(&[&i, &acc])
             }
             _ => self.call_or_leaf(Ty::Fl, d),
         }
@@ -453,7 +482,7 @@ impl Gen {
             kids.push(self.expr(*p, d - 1));
         }
         tpl.push(')');
-        E::node(ty, "call", &tpl, kids)
+        E::node(ty, "call", &tpl, kids).using(&[&f.name])
     }
 
     /// Control forms that work at any type.
@@ -487,7 +516,7 @@ impl Gen {
                 let body = self.expr(ty, d - 1);
                 self.scope.pop();
                 let form = *self.rng.pick(&["let", "let*", "letrec"]);
-                E::node(ty, "let", &format!("({form} ([{x} $0]) $1)"), vec![v, body])
+                E::node(ty, "let", &format!("({form} ([{x} $0]) $1)"), vec![v, body]).binding(&[&x])
             }
             46..=50 => {
                 // mutable captured local
@@ -504,14 +533,20 @@ impl Gen {
                     &format!("(let* ([{x} $0] [{g} (lambda () (set! {x} $1) {x})]) ({g}) $2)"),
                     vec![v, step, body],
                 )
+                .binding(&[&x])
             }
             51..=55 => {
                 // set! a settable variable of the same type in scope, else module var
                 let sty = *self.rng.pick(&[Ty::Int, Ty::Fl]);
-                let target = self.settable(sty).unwrap_or_else(|| if sty == Ty::Int { "mv".into() } else { "mf".into() });
+                let local = self.settable(sty);
+                let target = local.clone().unwrap_or_else(|| if sty == Ty::Int { "mv".into() } else { "mf".into() });
                 let v = self.expr(sty, d - 1);
                 let body = self.expr(ty, d - 1);
-                E::node(ty, "set", &format!("(begin (set! {target} $0) $1)"), vec![v, body])
+                let e = E::node(ty, "set", &format!("(begin (set! {target} $0) $1)"), vec![v, body]);
+                match &local {
+                    Some(n) => e.using(&[n]),
+                    None => e,
+                }
             }
             56..=60 => {
                 let a = self.expr(ty, d - 1);
@@ -542,9 +577,9 @@ impl Gen {
                 self.scope.pop();
                 self.scope.pop();
                 if self.rng.chance(0.5) {
-                    E::node(ty, "values", &format!("(let-values ([({x} {y}) (values $0 $1)]) $2)"), vec![a, b, body])
+                    E::node(ty, "values", &format!("(let-values ([({x} {y}) (values $0 $1)]) $2)"), vec![a, b, body]).binding(&[&x, &y])
                 } else {
-                    E::node(ty, "values", &format!("(call-with-values (lambda () (values $0 $1)) (lambda ({x} {y}) $2))"), vec![a, b, body])
+                    E::node(ty, "values", &format!("(call-with-values (lambda () (values $0 $1)) (lambda ({x} {y}) $2))"), vec![a, b, body]).binding(&[&x, &y])
                 }
             }
             75..=79 => {
@@ -580,6 +615,7 @@ impl Gen {
                     &format!("(letrec ([{f} (lambda ({n} {x}) (if (fx<= {n} 0) $0 {rec}))]) ({f} $2 $3))"),
                     vec![base, step, cnt, arg],
                 )
+                .binding(&[&n, &x])
             }
             85..=89 => {
                 let a = self.expr(Ty::Int, d - 1);
@@ -598,7 +634,7 @@ impl Gen {
                 let body = self.expr(ty, d - 1);
                 self.scope.pop();
                 if self.rng.chance(0.5) {
-                    E::node(ty, "lambda-app", &format!("((lambda ({x}) $1) $0)"), vec![a, body])
+                    E::node(ty, "lambda-app", &format!("((lambda ({x}) $1) $0)"), vec![a, body]).binding(&[&x])
                 } else {
                     E::node(
                         ty,
@@ -606,6 +642,7 @@ impl Gen {
                         &format!("(let ([{x} $0]) (define ({u} q) (set! {x} q) ({u} q)) $1)"),
                         vec![a, body],
                     )
+                    .binding(&[&x])
                 }
             }
             _ => {
@@ -629,7 +666,7 @@ impl Gen {
                 let v = self.fresh("v");
                 let e = self.expr(t, d);
                 self.scope.push((v.clone(), t, true));
-                E::node(Ty::Stmt, "", &format!("(define {v} $0)"), vec![e])
+                E::node(Ty::Stmt, "", &format!("(define {v} $0)"), vec![e]).defining(&[&v])
             }
             20..=24 => {
                 let (a, b) = (self.fresh("v"), self.fresh("v"));
@@ -637,7 +674,7 @@ impl Gen {
                 let eb = self.expr(Ty::Fl, d);
                 self.scope.push((a.clone(), Ty::Int, false));
                 self.scope.push((b.clone(), Ty::Fl, false));
-                E::node(Ty::Stmt, "", &format!("(define-values ({a} {b}) (values $0 $1))"), vec![ea, eb])
+                E::node(Ty::Stmt, "", &format!("(define-values ({a} {b}) (values $0 $1))"), vec![ea, eb]).defining(&[&a, &b])
             }
             25..=49 => {
                 let name = self.fresh("f");
@@ -658,13 +695,14 @@ impl Gen {
                     let ie = self.expr(it, d - 1);
                     self.scope.push((iv.clone(), it, true));
                     let body = self.expr(ret, d);
-                    E::node(ret, "internal-define", &format!("(define {iv} $0) $1"), vec![ie, body])
+                    E::node(ret, "internal-define", &format!("(define {iv} $0) $1"), vec![ie, body]).binding(&[&iv])
                 } else {
                     self.expr(ret, d)
                 };
                 self.scope.truncate(saved);
                 self.funs.push(Fun { name: name.clone(), params, ret });
-                E::node(Ty::Stmt, "", &format!("(define ({name} {}) $0)", names.join(" ")), vec![e])
+                let pn: Vec<&String> = names.iter().collect();
+                E::node(Ty::Stmt, "", &format!("(define ({name} {}) $0)", names.join(" ")), vec![e]).binding(&pn).defining(&[&name])
             }
             50..=54 => {
                 let e = self.expr(Ty::Int, d);
@@ -683,7 +721,7 @@ impl Gen {
         }
     }
 
-    pub fn program(&mut self) -> Vec<E> {
+    pub fn program(&mut self) -> Program {
         let n = 3 + self.rng.below(10);
         let d = 2 + self.rng.below(4);
         let mut items = vec![];
@@ -700,11 +738,45 @@ impl Gen {
                     kids.push(self.expr(*p, 2));
                 }
                 tpl.push_str("))");
-                items.push(E::node(Ty::Stmt, "call", &tpl, kids));
+                items.push(E::node(Ty::Stmt, "call", &tpl, kids).using(&[&f.name]));
             }
         }
-        items
+        Program(items)
     }
+}
+
+/// A generated module body: top-level items after the fixed prelude.
+#[derive(Clone)]
+pub struct Program(pub Vec<E>);
+
+impl std::fmt::Debug for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for it in &self.0 {
+            let mut s = String::new();
+            it.render(&mut s);
+            writeln!(f, "{s}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Well scoped: every free name of an item is defined by an earlier item
+/// (prelude names such as `mv` are not tracked).  Types are preserved by
+/// construction and by every shrink step.
+pub fn valid(p: &Program) -> bool {
+    let mut defined: Vec<String> = vec![];
+    for it in &p.0 {
+        if it.ty != Ty::Stmt {
+            return false;
+        }
+        let mut fr = vec![];
+        it.free(&mut fr);
+        if fr.iter().any(|n| !defined.contains(n)) {
+            return false;
+        }
+        defined.extend(it.defines.iter().cloned());
+    }
+    true
 }
 
 pub const PRELUDE: &str = r#"(module m racket/base
@@ -738,4 +810,111 @@ pub fn render_program(items: &[E]) -> String {
     }
     s.push_str("(writeln (list 'final mv mf (prm))))\n");
     s
+}
+
+// ---------------------------------------------------------------------------
+// ephyra generator
+
+use std::ops::ControlFlow;
+
+pub struct ProgramGen;
+
+fn paths(e: &E, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+    out.push(cur.clone());
+    for i in 0..e.kids.len() {
+        cur.push(i);
+        paths(&e.kids[i], cur, out);
+        cur.pop();
+    }
+}
+fn get_mut<'b>(e: &'b mut E, path: &[usize]) -> &'b mut E {
+    let mut cur = e;
+    for &i in path {
+        cur = &mut cur.kids[i];
+    }
+    cur
+}
+fn simplest(ty: Ty) -> Option<E> {
+    match ty {
+        Ty::Int => Some(E::atom(Ty::Int, "0")),
+        Ty::Fl => Some(E::atom(Ty::Fl, "0.0")),
+        Ty::Bool => Some(E::atom(Ty::Bool, "#t")),
+        Ty::Stmt => None,
+    }
+}
+
+impl ephyra::Gen for ProgramGen {
+    type Value = Program;
+    fn generate(&self, g: &mut Source) -> Program {
+        Gen::new(g).program()
+    }
+    /// Candidates, most promising first: drop a top-level item; replace a
+    /// node by a child of the same type; replace a node by the simplest
+    /// literal of its type.  Only well-scoped candidates are offered.
+    fn shrink(&self, p: &Program, visit: &mut dyn FnMut(Program) -> ControlFlow<()>) -> ControlFlow<()> {
+        for i in (0..p.0.len()).rev() {
+            let mut c = p.clone();
+            c.0.remove(i);
+            if valid(&c) {
+                visit(c)?;
+            }
+        }
+        for it in 0..p.0.len() {
+            let mut ps = vec![];
+            paths(&p.0[it], &mut vec![], &mut ps);
+            for path in &ps {
+                let mut c0 = p.clone();
+                let node = get_mut(&mut c0.0[it], path).clone();
+                if node.ty == Ty::Stmt {
+                    continue;
+                }
+                for k in node.kids.iter().filter(|k| k.ty == node.ty) {
+                    let mut c = p.clone();
+                    *get_mut(&mut c.0[it], path) = k.clone();
+                    if valid(&c) {
+                        visit(c)?;
+                    }
+                }
+                if let Some(s) = simplest(node.ty) {
+                    if s.tpl != node.tpl {
+                        let mut c = p.clone();
+                        *get_mut(&mut c.0[it], path) = s;
+                        visit(c)?;
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+#[ephyra::generator]
+pub fn valid_program(p: &Program) -> bool {
+    valid(p)
+}
+
+pub fn program_metrics(p: &Program, _size: usize) -> Vec<(&'static str, f64)> {
+    let mut tags = vec![];
+    for it in &p.0 {
+        it.tags(&mut tags);
+    }
+    let nodes: usize = p.0.iter().map(|e| e.size()).sum();
+    let mut text = String::new();
+    for it in &p.0 {
+        it.render(&mut text);
+    }
+    vec![
+        ("items", p.0.len() as f64),
+        ("nodes", nodes as f64),
+        ("chars", text.len() as f64),
+        ("loops", tags.iter().filter(|t| t.contains("loop") || t.starts_with("for")).count() as f64),
+        ("if", tags.iter().filter(|t| **t == "if").count() as f64),
+        ("fl", tags.iter().filter(|t| t.starts_with("fl")).count() as f64),
+        ("control", tags.iter().filter(|t| ["escape", "wcm", "dynamic-wind", "parameterize", "handlers"].contains(t)).count() as f64),
+    ]
+}
+
+#[ephyra::generator(valid_program, metrics = program_metrics)]
+pub fn programs() -> ProgramGen {
+    ProgramGen
 }

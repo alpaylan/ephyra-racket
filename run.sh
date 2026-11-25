@@ -4,4 +4,5 @@ set -euo pipefail
 BUILD=$(cd "$1" && pwd)
 mkdir -p "$4"
 OUT=$(cd "$4" && pwd)
-exec "$BUILD/harness/rktgen" run "$BUILD" "$2" "$3" "$OUT"
+# rktgen is built by build.sh with cargo into $BUILD/harness-target.
+exec "$BUILD/harness-target/release/rktgen" run "$BUILD" "$2" "$3" "$OUT"

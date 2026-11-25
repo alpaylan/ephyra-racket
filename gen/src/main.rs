@@ -10,9 +10,11 @@
 //!   crash : process death, internal-error messages, or a machine-code-only
 //!           timeout (the interpreter finished, so this is a compile hang).
 
-mod gen;
+use rktgen::gen;
 
-use gen::{render_program, Gen, E, Ty};
+use ephyra::{Config, Run, TestResult};
+use gen::{render_program, Program, ProgramGen, E};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -236,6 +238,7 @@ const PRIORITY: &[&str] = &[
 ];
 
 fn area(items: &[E]) -> String {
+    // the feature with the highest priority present in the shrunk program
     let mut tags = vec![];
     for it in items {
         it.tags(&mut tags);
@@ -246,97 +249,6 @@ fn area(items: &[E]) -> String {
         }
     }
     "toplevel".into()
-}
-
-/// Paths into a tree, for shrinking.
-fn get_mut<'a>(e: &'a mut E, path: &[usize]) -> &'a mut E {
-    let mut cur = e;
-    for &i in path {
-        cur = &mut cur.kids[i];
-    }
-    cur
-}
-fn paths(e: &E, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
-    out.push(cur.clone());
-    for i in 0..e.kids.len() {
-        cur.push(i);
-        paths(&e.kids[i], cur, out);
-        cur.pop();
-    }
-}
-fn simplest(ty: Ty) -> Option<E> {
-    match ty {
-        Ty::Int => Some(E::atom(Ty::Int, "0")),
-        Ty::Fl => Some(E::atom(Ty::Fl, "0.0")),
-        Ty::Bool => Some(E::atom(Ty::Bool, "#t")),
-        Ty::Stmt => None,
-    }
-}
-
-fn shrink(pair: &mut Pair, items: Vec<E>, want: &Verdict, budget: Duration) -> (Vec<E>, usize) {
-    let t0 = Instant::now();
-    let mut cur = items;
-    let mut tries = 0usize;
-    let mut test = |pair: &mut Pair, c: &[E], tries: &mut usize| -> bool {
-        *tries += 1;
-        let (a, b) = pair.query(&render_program(c));
-        &classify(&a, &b) == want
-    };
-    // 1. drop top-level items
-    let mut progress = true;
-    while progress && t0.elapsed() < budget {
-        progress = false;
-        let mut i = cur.len();
-        while i > 0 && t0.elapsed() < budget {
-            i -= 1;
-            let mut c = cur.clone();
-            c.remove(i);
-            if test(pair, &c, &mut tries) {
-                cur = c;
-                progress = true;
-            }
-        }
-    }
-    // 2. replace nodes by a same-typed child or the simplest literal
-    let mut progress = true;
-    while progress && t0.elapsed() < budget {
-        progress = false;
-        for it in 0..cur.len() {
-            let mut ps = vec![];
-            paths(&cur[it], &mut vec![], &mut ps);
-            let mut pi = 0;
-            while pi < ps.len() && t0.elapsed() < budget {
-                let node = get_mut(&mut cur[it], &ps[pi]).clone();
-                let mut cands: Vec<E> = node.kids.iter().filter(|k| k.ty == node.ty && node.ty != Ty::Stmt).cloned().collect();
-                if !node.kids.is_empty() || node.tpl.len() > 2 {
-                    if let Some(s) = simplest(node.ty) {
-                        if s.tpl != node.tpl {
-                            cands.push(s);
-                        }
-                    }
-                }
-                let mut changed = false;
-                for cand in cands {
-                    let mut c = cur.clone();
-                    *get_mut(&mut c[it], &ps[pi]) = cand;
-                    if test(pair, &c, &mut tries) {
-                        cur = c;
-                        changed = true;
-                        progress = true;
-                        break;
-                    }
-                }
-                if changed {
-                    ps.clear();
-                    paths(&cur[it], &mut vec![], &mut ps);
-                    // keep pi: retry the same position
-                } else {
-                    pi += 1;
-                }
-            }
-        }
-    }
-    (cur, tries)
 }
 
 fn json_str(s: &str) -> String {
@@ -411,29 +323,13 @@ struct Search {
 }
 
 impl Search {
-    fn record(&mut self, deadline: Instant, pair: &mut Pair, items: Vec<E>, v: &Verdict, seed_label: &str, a: &Res, b: &Res) {
+    /// Write a finding for the (already shrunk) program; `ra`/`rb` are its results.
+    fn record(&mut self, small: &Program, v: &Verdict, seed_label: &str, ra: &Res, rb: &Res) {
         let (oracle, kind) = match v {
             Verdict::Fail(o, k) => (*o, *k),
             _ => return,
         };
-        let ok_key = format!("{oracle}__{kind}");
-        let n = self.shrinks_per_kind.entry(ok_key).or_insert(0);
-        if *n >= 40 {
-            return;
-        }
-        *n += 1;
-        let (small, ra, rb) = if kind == "hang" {
-            (items, a.clone(), b.clone())
-        } else {
-            let (s, _) = shrink(pair, items, v, Duration::from_secs(90).min(deadline.saturating_duration_since(Instant::now())));
-            let (ra, rb) = pair.query(&render_program(&s));
-            if &classify(&ra, &rb) == v {
-                (s, ra, rb)
-            } else {
-                // flaky after shrinking: keep the unshrunk program state we have
-                (s, a.clone(), b.clone())
-            }
-        };
+        let small = &small.0;
         let sig = format!("{oracle}__{kind}__{}", area(&small));
         let cnt = self.per_sig.entry(sig.clone()).or_insert(0);
         if *cnt >= 3 {
@@ -442,10 +338,10 @@ impl Search {
         *cnt += 1;
         let dir = self.out.join("findings").join(&sig).join(cnt.to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        let prog = render_program(&small);
+        let prog = render_program(small);
         std::fs::write(dir.join("prog.rkt"), &prog).unwrap();
         std::fs::copy(&self.runner_src, dir.join("runner.rkt")).unwrap();
-        let msg = format!("machine-code: {}\ninterpreter:  {}", res_text(&ra), res_text(&rb));
+        let msg = format!("machine-code: {}\ninterpreter:  {}", res_text(ra), res_text(rb));
         std::fs::write(dir.join("results.txt"), &msg).unwrap();
         let fj = format!(
             "{{\"signature\": {}, \"oracle\": {}, \"message\": {}, \"seed\": {}}}\n",
@@ -463,9 +359,33 @@ impl Search {
     }
 }
 
-fn case_seed(seed: u64, i: u64) -> u64 {
-    let mut r = gen::Rng::new(seed.wrapping_mul(0x100000001B3) ^ i.wrapping_mul(0x9E3779B97F4A7C15));
-    r.next()
+fn mix(seed: u64, i: u64) -> u64 {
+    let mut z = seed.wrapping_mul(0x100000001B3) ^ i.wrapping_mul(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// One failure site per (oracle, kind): ephyra keeps the panic site while
+/// shrinking, so a shrink never trades one kind of failure for another.
+fn fail_at(v: &Verdict, detail: &str) {
+    match v {
+        Verdict::Fail("diff", "value") => panic!("diff value: {detail}"),
+        Verdict::Fail("diff", "error") => panic!("diff error: {detail}"),
+        Verdict::Fail("diff", "errmsg") => panic!("diff errmsg: {detail}"),
+        Verdict::Fail("crash", "died") => panic!("crash died: {detail}"),
+        Verdict::Fail("crash", "internal") => panic!("crash internal: {detail}"),
+        Verdict::Fail("crash", "hang") => panic!("crash hang: {detail}"),
+        Verdict::Fail(o, k) => panic!("{o} {k}: {detail}"),
+        _ => {}
+    }
+}
+
+/// Last property evaluation, read by the search loop after `run.test`.
+struct Last {
+    verdict: Verdict,
+    a: Res,
+    b: Res,
 }
 
 fn write_stats(out: &Path, cases: u64, failures: u64, extra: &BTreeMap<String, u64>, rate: f64) {
@@ -486,9 +406,9 @@ fn main() {
             let seed: u64 = args[2].parse().unwrap();
             let n: u64 = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(1);
             for i in 0..n {
-                let mut g = Gen::new(case_seed(seed, i));
-                let p = g.program();
-                println!(";; case {seed}:{i}\n{}", render_program(&p));
+                let mut src = ephyra::Source::new(mix(seed, i), 10);
+                let p = ephyra::Gen::generate(&ProgramGen, &mut src);
+                println!(";; case {seed}:{i}\n{}", render_program(&p.0));
             }
         }
         Some("run") => {
@@ -501,49 +421,111 @@ fn main() {
             let runner = build.join("harness/runner.rkt");
             let t0 = Instant::now();
             let deadline = t0 + Duration::from_secs(secs);
-            let mut pair = Pair::new(racket, runner.clone());
+            let pair = RefCell::new(Pair::new(racket, runner.clone()));
+            let last: RefCell<Option<Last>> = RefCell::new(None);
             let mut search = Search { out: out.clone(), runner_src: runner, per_sig: HashMap::new(), shrinks_per_kind: HashMap::new() };
             let mut extra: BTreeMap<String, u64> = BTreeMap::new();
             let (mut cases, mut failures) = (0u64, 0u64);
-            let mut last = Instant::now();
-            let mut i = 0u64;
+            let mut last_write = Instant::now();
             write_stats(&out, 0, 0, &extra, 0.0);
-            while Instant::now() < deadline {
-                let label = format!("{seed}:{i}");
-                let mut g = Gen::new(case_seed(seed, i));
-                i += 1;
-                let items = g.program();
-                let prog = render_program(&items);
-                let (a, b) = pair.query(&prog);
-                cases += 1;
+            let property = |p: Program| -> TestResult {
+                let (a, b) = pair.borrow_mut().query(&render_program(&p.0));
                 let v = classify(&a, &b);
-                if let Res::Line(l) = &a {
-                    *extra.entry(format!("result_{}", kind_of(l))).or_insert(0) += 1;
-                    if l.contains("exn:fail:syntax") || l.contains("exn:fail:read") {
-                        // generator bug indicator: should stay 0
-                        *extra.entry("gen_syntax_errors".into()).or_insert(0) += 1;
-                    }
-                    *extra.entry("stmt_errors".into()).or_insert(0) += l.matches("(exn ").count() as u64;
-                    *extra.entry("masked_nonfx_msg".into()).or_insert(0) += (l.matches("masked").count()) as u64;
-                }
+                let detail = format!("machine={} interp={}", res_text(&a), res_text(&b));
+                *last.borrow_mut() = Some(Last { verdict: v.clone(), a, b });
                 match &v {
-                    Verdict::Pass => {}
-                    Verdict::Skip(r) => *extra.entry(format!("skip_{r}")).or_insert(0) += 1,
-                    Verdict::Fail(o, k) => {
-                        failures += 1;
-                        *extra.entry(format!("fail_{o}_{k}")).or_insert(0) += 1;
-                        search.record(deadline, &mut pair, items, &v, &label, &a, &b);
+                    Verdict::Pass => TestResult::check(true, ""),
+                    // timeouts/oom: not comparable (documented in README)
+                    Verdict::Skip(r) => TestResult::discard(*r),
+                    Verdict::Fail(..) => {
+                        fail_at(&v, &detail);
+                        unreachable!()
                     }
                 }
-                if last.elapsed() > Duration::from_secs(5) {
-                    last = Instant::now();
-                    extra.insert("server_restarts".into(), pair.restarts);
-                    write_stats(&out, cases, failures, &extra, cases as f64 / t0.elapsed().as_secs_f64());
+            };
+            // Segments: one ephyra Run each; a Run stops at its first
+            // failure, which is shrunk by ephyra and written as a finding.
+            let mut segment = 0u64;
+            while Instant::now() < deadline {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let mut cfg = Config::default()
+                    .tests(1_000_000_000)
+                    .seed(mix(seed, 1_000_000 + segment))
+                    .name("racket_machine_vs_interp")
+                    .budget(left)
+                    .no_regressions();
+                cfg.max_discard_ratio = 1e9;
+                cfg.shrink.max_steps = 600;
+                cfg.shrink.timeout_ms = Some(left.min(Duration::from_secs(90)).as_millis() as u64);
+                cfg.locate.enabled = false;
+                let seg_seed = cfg.seed.unwrap();
+                segment += 1;
+                let mut run = Run::new(&cfg, ProgramGen, &property);
+                let mut failed: Option<(Program, Verdict, Res, Res, u64)> = None;
+                while run.wants_more() && Instant::now() < deadline {
+                    let Some(input) = run.draw() else { continue };
+                    let iter = input.iteration();
+                    let tested = run.test(&input);
+                    cases += 1;
+                    let l = last.borrow_mut().take();
+                    if let Some(Last { verdict, a, b }) = l {
+                        if let Res::Line(l) = &a {
+                            *extra.entry(format!("result_{}", kind_of(l))).or_insert(0) += 1;
+                            if l.contains("exn:fail:syntax") || l.contains("exn:fail:read") {
+                                // generator bug indicator: should stay 0
+                                *extra.entry("gen_syntax_errors".into()).or_insert(0) += 1;
+                            }
+                            *extra.entry("stmt_errors".into()).or_insert(0) += l.matches("(exn ").count() as u64;
+                            *extra.entry("masked_nonfx_msg".into()).or_insert(0) += l.matches("masked").count() as u64;
+                        }
+                        match &verdict {
+                            Verdict::Skip(r) => *extra.entry(format!("skip_{r}")).or_insert(0) += 1,
+                            Verdict::Fail(o, k) => {
+                                *extra.entry(format!("fail_{o}_{k}")).or_insert(0) += 1;
+                            }
+                            Verdict::Pass => {}
+                        }
+                        if tested.failed() {
+                            failures += 1;
+                            failed = Some((input.value.clone(), verdict, a, b, iter));
+                            break;
+                        }
+                    }
+                    if last_write.elapsed() > Duration::from_secs(5) {
+                        last_write = Instant::now();
+                        extra.insert("server_restarts".into(), pair.borrow().restarts);
+                        write_stats(&out, cases, failures, &extra, cases as f64 / t0.elapsed().as_secs_f64());
+                    }
                 }
+                if let Some((orig, v, a, b, iter)) = failed {
+                    let key = match &v {
+                        Verdict::Fail(o, k) => format!("{o}__{k}"),
+                        _ => String::new(),
+                    };
+                    let n = search.shrinks_per_kind.entry(key).or_insert(0);
+                    *n += 1;
+                    // hangs cost a timeout per shrink step; after 40 shrinks of one
+                    // kind further failures are only counted.
+                    let small = if *n <= 40 && !matches!(v, Verdict::Fail(_, "hang")) {
+                        run.shrink().cloned().unwrap_or(orig.clone())
+                    } else {
+                        run.shrunk_to(orig.clone());
+                        orig.clone()
+                    };
+                    if *n <= 40 {
+                        let (ra, rb) = pair.borrow_mut().query(&render_program(&small.0));
+                        let (ra, rb) = if classify(&ra, &rb) == v { (ra, rb) } else { (a, b) };
+                        search.record(&small, &v, &format!("{seg_seed}:{iter}"), &ra, &rb);
+                    }
+                }
+                let _ = run.finish();
+                extra.insert("server_restarts".into(), pair.borrow().restarts);
+                extra.insert("segments".into(), segment);
+                write_stats(&out, cases, failures, &extra, cases as f64 / t0.elapsed().as_secs_f64());
             }
-            extra.insert("server_restarts".into(), pair.restarts);
+            extra.insert("server_restarts".into(), pair.borrow().restarts);
             write_stats(&out, cases, failures, &extra, cases as f64 / t0.elapsed().as_secs_f64());
-            pair.close();
+            pair.into_inner().close();
         }
         _ => {
             eprintln!("usage: rktgen run <build-dir> <seed> <seconds> <out-dir> | rktgen sample <seed> [n]");

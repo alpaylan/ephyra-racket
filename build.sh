@@ -20,14 +20,22 @@ cd "$BUILD/src"
 if [ "$MODE" = coverage ]; then
   LLVM_BIN=/usr/lib/llvm-21/bin
   export CC="$LLVM_BIN/clang"
-  export CFLAGS="-O2 -fprofile-instr-generate -fcoverage-mapping"
+  # The build happens in a copy; map its paths back to the tree we were given
+  # so the coverage map names the tree's sources.
+  export CFLAGS="-O2 -fprofile-instr-generate -fcoverage-mapping -fcoverage-prefix-map=$BUILD/src=$SRC"
   export LDFLAGS="-fprofile-instr-generate"
   # Instrumented build-time tools write profiles; keep them out of the tree.
   mkdir -p "$BUILD/build-profraw"
   export LLVM_PROFILE_FILE="$BUILD/build-profraw/%m_%p.profraw"
 fi
+# zuo does not notice changed CFLAGS: start the C build over when they change.
+STAMP="$BUILD/cflags.stamp"
+if [ "$(cat "$STAMP" 2>/dev/null)" != "${CC:-}|${CFLAGS:-}" ]; then
+  [ -e "$STAMP" ] && rm -rf "$BUILD/src/racket/src/build"
+fi
 make base CPUS=16 JOBS=16 PKGS=racket-lib > "$BUILD/make.log" 2>&1 || {
   tail -40 "$BUILD/make.log"; exit 1; }
+echo "${CC:-}|${CFLAGS:-}" > "$STAMP"
 RACKET="$BUILD/src/racket/bin/racket"
 "$RACKET" -l racket/base -e '(void)' >/dev/null
 
@@ -35,7 +43,6 @@ RACKET="$BUILD/src/racket/bin/racket"
 CARGO_TARGET_DIR="$BUILD/harness-target" cargo build --release --quiet \
   --manifest-path "$HERE/gen/Cargo.toml"
 mkdir -p "$BUILD/harness"
-cp "$BUILD/harness-target/release/rktgen" "$BUILD/harness/rktgen"
 cp "$HERE/racket/runner.rkt" "$BUILD/harness/runner.rkt"
 # Compile the runner to machine code so the interpreter server only
 # interprets the generated programs, not the runner itself.

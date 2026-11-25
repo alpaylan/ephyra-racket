@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+ephyra = "0.0.1"
 
 [workspace]
 
