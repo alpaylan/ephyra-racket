@@ -296,7 +296,15 @@ modes against the given build and exits 1/0/2.
 
 `cases`, `failures`, `cases_per_sec`, `result_{ok,exn,raise}` (machine-code side), `stmt_errors`
 (errors caught by `show`), `gen_syntax_errors` (generator bugs; should be absent/0), `fail_*`,
-`skip_*`, `masked_nonfx_msg`, `server_restarts`, `segments`.
+`skip_*` (incl. `skip_ref93_{noresult,unbound,internal,continuation,known_*}`), `variant_cmp_<v>`
+(cases compared under variant v, incl. `variant_cmp_ref93`), `masked_nonfx_msg`,
+`server_restarts`, `segments`. `rktgen norm93 prog.rkt < result-lines` prints the ref93
+comparison form.
+
+Round 7 check (patched base build, 8 x 700 s + 4 x 500 s): ~28 000 cases, ~4 100 ref93
+comparisons, 0 failures; one earlier ref93 finding was a 9.3 bug repaired in trunk (8f67966b14),
+now skipped. On the unpatched trunk the old clusters (composable, splitmi set) still appear
+within minutes.
 
 ## Throughput
 
