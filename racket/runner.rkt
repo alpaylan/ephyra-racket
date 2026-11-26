@@ -1084,7 +1084,7 @@
 ;; (valid_program), so no forward reference or redefinition exists and
 ;; the top level's documented differences (reference/eval-model.scrbl, the
 ;; top level is "hopeless" only for those) do not apply.  For a third of the
-;; programs the opaque rewrite is applied first.  topzo: each form compiled,
+;; programs the opaque rewrite is applied first (a sixth: ctlnoise).  topzo: each form compiled,
 ;; written, read back and evaluated (per form), or for half of the programs
 ;; the prelude per form and then all generated items as one `(begin ...)`
 ;; compiled at once (a compiled top-level sequence, its definitions declared
@@ -1122,9 +1122,10 @@
         fs))
   (cons '(define (top-print% . vs) (for-each (current-print) vs)) fs*))
 (define (top-base form src)
-  (if (zero? ((macro-rng (string-append "topopq" src)) 3))
-      (opaque-module form src)
-      form))
+  (case ((macro-rng (string-append "topopq" src)) 6)
+    [(0 1) (opaque-module form src)]
+    [(2) (opaque-module form src #t)]   ; ctlnoise wrappers
+    [else form]))
 (define (run-top variant form src)
   (define rng (macro-rng (string-append "top" variant src)))
   (case variant

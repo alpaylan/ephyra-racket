@@ -417,7 +417,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      top-print%)`. Generated names are unique and refer only to earlier definitions, so no forward
      reference or redefinition exists (the documented top-level differences, reference
      eval-model.scrbl "top-level is hopeless", are about those). For a third of the programs the
-     opaque rewrite is applied first. `topzo`: per form `compile` + zo round trip + `eval`, or (half
+     opaque rewrite is applied first, for a sixth the ctlnoise one. `topzo`: per form `compile` + zo round trip + `eval`, or (half
      of the programs) the prelude per form and then all generated items as one compiled top-level
      `(begin ...)` (one compiled object holding several top-level linklets; `compile` of a begin
      does not run a `define-syntax` of the same begin, hence the prelude first). `topsplit`: the
