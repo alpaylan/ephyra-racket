@@ -469,3 +469,11 @@ dies with "invalid memory reference"; it needs cptypes (`enable-type-recovery #f
 Round 11 check (same kind of build, 4 x 360 s, 6 669 cases): 4 failures (0.06%), all
 future variants, all nested-future continuation failures (futuresplit reentry/composable, futurezo
 composable/reentry); 500 sampled programs x 4 future variants gave 2 programs differing (both nested).
+
+Round 12 check (same kind of build, 3 x (4 x 420-480 s), ~27 000 cases, ~950 port /
+portsplit comparisons): 582 sampled port programs x {port, portsplit} gave no differences; two
+harness false positives found and fixed (bad arguments to `pa:open-input-bytes` from the shrinker;
+racket/port `*-evt` on ports without progress events, which port-lib.scrbl excludes). The remaining
+failures (~0.02%) are all the future crash described under `port` (future/futurezo/futuresplit
+`__died__*`, message `internal-error: attempting to suspend a future in uninterruptible mode`).
+Throughput 6.3 cases/s solo vs 7.5 before (port constructs, racket/port loaded per namespace).
