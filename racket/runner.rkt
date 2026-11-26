@@ -68,10 +68,25 @@
 ;;            (to a helper thread) at a later event check
 ;;   preemptctl  preempt, some sites wrapped in the ctlnoise forms instead
 ;;   preemptsplit  preempt, then split, each module through a zo round trip
+;;   Chez compiler knobs Racket never sets (steering round 10); every one of
+;;   them also turns on $enable-check-prelex-flags (Chez's own check that
+;;   prelex referenced/assigned flags are consistent after each front pass;
+;;   only run on the compile-to-port path, so half of the programs of each
+;;   single-knob variant go through a zo round trip; the Chez mats run
+;;   with it, mats/build.zuo `ecpf`, like `spi` and `cl`):
+;;   common   commonization-level 1..9 (cpcommonize pass)
+;;   noclos   $optimize-closures #f, $lift-closures #f (np-expand-closures)
+;;   notrap   generate-interrupt-trap #f (no event-check code in user code)
+;;   dbg      debug-level 3, generate-inspector-information #t
+;;   noinl    $suppress-primitive-inlining #t (library calls, no cpprim code)
+;;   chezmix  a combination of the above (+ notr, cp0big), chosen from the
+;;            program text, applied to the module rewritten by opaque, local
+;;            or split (or unchanged); chezmixzo: same + zo round trip
 (define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
                    "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"
                    "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"
-                   "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"))
+                   "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"
+                   "common" "noclos" "notrap" "dbg" "noinl" "chezmix" "chezmixzo"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -496,11 +511,7 @@
   (define p-expr (vector-ref (if pre? #(2 3 12) #(6 12 40)) (rng 3)))  ; 1/k other subexpressions
   ;; preempt: also arm the timer at the start of 1/k function bodies
   (define p-entry (if pre? (vector-ref #(1 2 1000000) (rng 3)) 1000000))
-  ;; only the preempt variants define `pre-v`; with p-entry = 1000000 the
-  ;; pick still fires about once per million bodies, so guard on pre? too
-  ;; (pick first: the rng stream, and so every other rewrite, is unchanged)
-  ;; (else gc/opaque/ctl variants failed with `pre-v: unbound identifier`)
-  (define (prologue bs) (if (and (pick p-entry) pre?) (cons '(pre-v (void)) bs) bs))
+  (define (prologue bs) (if (pick p-entry) (cons '(pre-v (void)) bs) bs))
   (define p-user (vector-ref #(1 2 4) (rng 3)))    ; 1/k user callees
   (define p-prim (vector-ref #(1 2 4 1000000) (rng 4))) ; 1/k primitive callees
   (define (pick k) (zero? (rng k)))
@@ -751,6 +762,134 @@
 (define chez-score (vm-eval 'cp0-score-limit))
 (define chez-effort (vm-eval 'cp0-effort-limit))
 (define chez-unroll (vm-eval 'cp0-outer-unroll-limit))
+(define chez-common (vm-eval 'commonization-level))
+(define chez-optclos (vm-eval '($primitive $optimize-closures)))
+(define chez-liftclos (vm-eval '($primitive $lift-closures)))
+(define chez-trap (vm-eval 'generate-interrupt-trap))
+(define chez-debug-level (vm-eval 'debug-level))
+(define chez-inspinfo (vm-eval 'generate-inspector-information))
+(define chez-noinline (vm-eval '($primitive $suppress-primitive-inlining)))
+(define chez-check-prelex (vm-eval '($primitive $enable-check-prelex-flags)))
+(define chez-knobs2 (list chez-common chez-optclos chez-liftclos chez-trap chez-debug-level
+                          chez-inspinfo chez-noinline chez-check-prelex))
+
+;; ---------------------------------------------------------------------
+;; Preemption (variants preempt, preemptctl, preemptsplit; steering round 9).
+;; Racket threads are Chez engines (rumble engine.ss): when the engine's
+;; timer runs out at an event check (procedure entry, loop back-edge), the
+;; timer interrupt captures the metacontinuation and the scheduler swaps in
+;; another thread; the case thread resumes later where it stopped.  With the
+;; default quantum (thread/config.rkt TICKS 100000) that happens a handful of
+;; times per case at the same few places.  Here the opaque sites are wrapped
+;; in `(pre-v e)`, which evaluates `e`, then lowers the remaining ticks to
+;; 1..K (K per program: 2, 8, 32 or 400), so the interrupt fires at an
+;; arbitrary later event check, also inside loops with unboxed flonum locals,
+;; inside prompts, dynamic-wind, parameterize, marks, handlers and
+;; continuation applications.  A helper green thread (created by the runner,
+;; its output discarded) is always runnable: it yields with `(sleep 0)` inside
+;; its own parameterize + continuation mark and checks that both, a flonum
+;; accumulator and a ring of vectors survive the swaps; a failure becomes an
+;; `internal error` result line.  Expected: thread switches are not
+;; observable by a program that does not share state with other threads
+;; (reference/threads.scrbl: threads run concurrently; nothing allows a
+;; context switch to change a single thread's results), so the output must
+;; equal the default run's.
+(define (preempt-defs src)
+  (define rng (macro-rng (string-append "preK" src)))
+  `((require (only-in ffi/unsafe/vm vm-primitive))
+    (define pre-st (vm-primitive 'set-timer))
+    (define pre-n 0)
+    (define (pre-v x)
+      (set! pre-n (add1 pre-n))
+      (let ([o (pre-st 0)])
+        (pre-st (if (> o 0) (min o (add1 (modulo (* pre-n 7919) ,(vector-ref #(2 8 32 400) (rng 4))))) 0)))
+      x)))
+
+(define (preempt-variant? v) (member v '("preempt" "preemptctl" "preemptsplit")))
+
+(define (preempt-module form src [ctl? #f])
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append "preempt" src)))
+  `(module m ,lang ,@pre ,@(preempt-defs src) ,@(if ctl? ctl-defs '())
+     ,@(opaque-rewrite-items items (cdddr form) rng (if ctl? 'prectl 'pre))))
+
+(define pre-param (make-parameter 0))
+(define pre-swaps 0)   ; helper iterations (RKT_PRE_DEBUG prints them)
+;; the helper thread; sets `fail` to a message when a check fails
+(define (start-preempt-helper! fail)
+  (parameterize ([current-output-port (open-output-nowhere)]
+                 [current-error-port (open-output-nowhere)])
+    (thread
+     (lambda ()
+       (with-handlers ([(lambda (e) #t)
+                        (lambda (e) (set-box! fail (format "helper raised ~a"
+                                                           (if (exn? e) (first-line (exn-message e)) e))))])
+         (define ring (make-vector 32 #f))
+         (let loop ([i 0] [acc 0.0])
+           (define v (vector i (exact->inexact i) (list i (number->string i))))
+           (vector-set! ring (modulo i 32) v)
+           (parameterize ([pre-param i])
+             (with-continuation-mark 'pre-key i
+               (begin
+                 (sleep 0)
+                 (unless (and (eqv? (pre-param) i)
+                              (eqv? (continuation-mark-set-first #f 'pre-key) i))
+                   (set-box! fail "helper's parameterization or mark changed across a swap"))
+                 (void))))
+           (unless (fl= acc (fl* (->fl i) 0.25))
+             (set-box! fail "helper's flonum accumulator changed across a swap"))
+           (when (>= i 32)
+             (define old (vector-ref ring (modulo (- i 31) 32)))
+             (define k (- i 31))
+             (unless (and (eqv? (vector-ref old 0) k) (eqv? (vector-ref old 1) (exact->inexact k))
+                          (equal? (vector-ref old 2) (list k (number->string k))))
+               (set-box! fail "helper's ring vector changed across a swap")))
+           (set! pre-swaps (add1 pre-swaps))
+           (unless (unbox fail) (loop (add1 i) (fl+ acc 0.25)))))))))
+
+;; ---------------------------------------------------------------------
+;; Metamorphic "local" rewrite (variants local, localpart; steering round 8).
+;; The generated module-level items (all of them for `local`, a suffix
+;; chosen from the program text for `localpart`) are moved into the body of
+;; a function, an internal-definition context:
+;;   (define (main%) <items'> (void)) (main%)       ; or
+;;   (let () <items'> (void))                       ; a module-level expression
+;; Module-level definitions (constants for schemify, known procedures,
+;; cross-form inlining) become letrec* bindings of one closure body: Chez
+;; cpletrec, closure conversion, local set! boxes, schemify's lift and
+;; mutated-state analysis, inlining by cp0 instead of schemify.  A module body
+;; prints the values of its expression forms with `current-print` and runs
+;; each in a prompt for the default tag (reference/syntax.scrbl `module`);
+;; an internal body discards them, so each expression item e becomes
+;; (call-with-values (lambda () e) local-print%), and half of the programs
+;; also wrap it in `call-with-continuation-prompt`.  Definitions keep their
+;; order; generated names are unique and only refer to earlier definitions
+;; (valid_program), so letrec* semantics equal the module's.  Expected:
+;; reference/syntax.scrbl, internal definitions are `letrec-syntaxes+values`
+;; with the same left-to-right evaluation; output must be identical.
+(define (local-module form src [part? #f])
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append (if part? "localpart" "local") src)))
+  (define k (if part? (rng (add1 (length items))) 0))
+  (define-values (keep moved) (split-at items k))
+  (define prompt? (zero? (rng 2)))
+  (define (def? f) (and (pair? f) (memq (car f) '(define define-values))))
+  (define body
+    (for/list ([f moved])
+      (cond [(def? f) f]
+            [prompt? `(call-with-values
+                       (lambda () (call-with-continuation-prompt (lambda () ,f)))
+                       local-print%)]
+            [else `(call-with-values (lambda () ,f) local-print%)])))
+  (define wrapped
+    (if (zero? (rng 2))
+        `((define (main%) ,@body (void)) (main%))
+        `((let () ,@body (void)))))
+  `(module m ,lang ,@pre
+     (define (local-print% . vs) (for-each (current-print) vs))
+     ,@keep ,@wrapped))
 
 ;; ---------------------------------------------------------------------
 ;; Preemption (variants preempt, preemptctl, preemptsplit; steering round 9).
@@ -877,19 +1016,55 @@
 
 ;; Sets Chez-level knobs (per OS thread, so they apply to the case thread
 ;; too); returns a thunk that restores them.
-(define (set-chez-knobs! variant)
+(define (set-chez-knobs! variant [src ""])
   (define cp0 (chez-run-cp0))
   (define tr (chez-type-recovery))
   (define sc (chez-score))
   (define ef (chez-effort))
   (define un (chez-unroll))
+  (define saved (for/list ([k (in-list chez-knobs2)]) (k)))
+  (define (noclos!) (chez-optclos #f) (chez-liftclos #f))
+  (define (dbg!) (chez-debug-level 3) (chez-inspinfo #t))
+  (define (knob2!) (chez-check-prelex #t))
   (case variant
     [("nocp0") (chez-run-cp0 (lambda (cp0 x) x))]
     [("notr") (chez-type-recovery #f)]
     [("cp0big") (chez-score 120) (chez-effort 5000) (chez-unroll 2)]
+    [("common") (knob2!) (chez-common (add1 (modulo (string-length src) 9)))]
+    [("noclos") (knob2!) (noclos!)]
+    [("notrap") (knob2!) (chez-trap #f)]
+    [("dbg") (knob2!) (dbg!)]
+    [("noinl") (knob2!) (chez-noinline #t)]
+    [("chezmix" "chezmixzo")
+     (knob2!)
+     (define rng (macro-rng (string-append "chezmix" src)))
+     ;; at least one knob: draw until something was set
+     (let loop ([n 0])
+       (define any? #f)
+       (define-syntax-rule (maybe k e ...) (when (< (rng 100) k) (set! any? #t) e ...))
+       (maybe 40 (chez-common (add1 (rng 9))))
+       (maybe 35 (noclos!))
+       (maybe 25 (chez-trap #f))
+       (maybe 30 (dbg!))
+       (maybe 20 (chez-noinline #t))
+       (maybe 20 (chez-type-recovery #f))
+       (maybe 20 (chez-score 120) (chez-effort 5000) (chez-unroll 2))
+       (unless (or any? (> n 5)) (loop (add1 n))))]
     [else (void)])
   (lambda ()
+    (for ([k (in-list chez-knobs2)] [v (in-list saved)]) (k v))
     (chez-run-cp0 cp0) (chez-type-recovery tr) (chez-score sc) (chez-effort ef) (chez-unroll un)))
+
+(define (chezmix-variant? v) (member v '("chezmix" "chezmixzo")))
+;; the rewrite chezmix applies (deterministic in the text)
+(define (chezmix-forms form src)
+  (define rng (macro-rng (string-append "chezmixrw" src)))
+  (case (rng 5)
+    [(0) (list form)]
+    [(1) (list (opaque-module form src))]
+    [(2) (list (local-module form src #t))]
+    [(3) (split-module form)]
+    [else (split-module (opaque-module form src #t))]))
 
 (define TIMEOUT (let ([s (getenv "RKT_CASE_TIMEOUT")]) (if s (string->number s) 10)))
 (define MAX-OUT 20000)
@@ -916,7 +1091,7 @@
   (define cust (make-custodian))
   (custodian-limit-memory cust (* 2048 1024 1024) cust)
   (define result #f)
-  (define restore! (set-chez-knobs! variant))
+  (define restore! (set-chez-knobs! variant src0))
   (define-values (gc-restore! check-heap?)
     (if (gc-variant? variant) (set-gc-knobs! src) (values void #f)))
   (define pre-fail (and (preempt-variant? variant) (box #f)))
@@ -992,6 +1167,15 @@
                      [("preemptsplit")
                       (for ([f (split-module (preempt-module form src))])
                         (eval (zo-round-trip (compile f))))]
+                     [("common" "noclos" "notrap" "dbg" "noinl")
+                      ;; half of the programs through compile-to-port (the
+                      ;; file-compile path, where Chez runs its prelex check)
+                      (if (zero? ((macro-rng (string-append "knobzo" src)) 2))
+                          (eval (zo-round-trip (compile form)))
+                          (eval form))]
+                     [("chezmix") (for ([f (chezmix-forms form src)]) (eval f))]
+                     [("chezmixzo")
+                      (for ([f (chezmix-forms form src)]) (eval (zo-round-trip (compile f))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
                    (when (equal? variant "macrosub")
@@ -1069,6 +1253,7 @@
                 [("preempt") (list (preempt-module form src))]
                 [("preemptctl") (list (preempt-module form src #t))]
                 [("preemptsplit") (split-module (preempt-module form src))]
+                [("chezmix" "chezmixzo") (chezmix-forms form src)]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])

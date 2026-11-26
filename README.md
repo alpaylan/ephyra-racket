@@ -238,7 +238,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      They get about a quarter of the drawn cases. Cost: ~0.17-0.22 s per case vs 0.06 s default.
      A 25-program probe on the coverage build reached +12 000 C regions (gc.c, gc-par.inc,
      gc-oce.inc) over the cumulative profile.
-   - `ref93` (second reference): the same module, variant `none`, on a sixth
+   - `ref93` (second reference, steering round 7): the same module, variant `none`, on a sixth
      server (`f`, started on first use) running the released **Racket 9.3 CS** (minimal),
      which build.sh copies into `<build>/ref93` (from `$REF93_SRC` or the tarball `$REF93_TGZ` if set, else
      download.racket-lang.org) with the runner compiled by it in `<build>/harness93`. Compared
@@ -276,7 +276,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `equal?` of hashes; never iteration order). Area tags `lib-num`, `lib-numstr`, `lib-cmp`,
      `lib-string`, `lib-char`, `lib-bytes`, `lib-symbol`, `lib-regexp`, `lib-print`, `lib-list`,
      `lib-hash`, `lib-typed`.
-   - `local`, `localpart`, `localzo` (metamorphic, runner.rkt `local-module`):
+   - `local`, `localpart`, `localzo` (metamorphic, steering round 8; runner.rkt `local-module`):
      the generated module-level items (all for `local`; for `localpart`/`localzo` a suffix
      starting at an index chosen from the program text, the rest stays at module level) are
      moved into an internal-definition body, either `(define (main%) <items> (void)) (main%)` or a
@@ -291,7 +291,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (`letrec-syntaxes+values`, left to right) semantics give the same output. `localzo` =
      `localpart` + zo round trip. About a fifth of the drawn cases.
      `racket runner.rkt macrodump prog.rkt local` prints the rewrite.
-   - `preempt`, `preemptctl`, `preemptsplit` (metamorphic, runner.rkt
+   - `preempt`, `preemptctl`, `preemptsplit` (metamorphic, steering round 9; runner.rkt
      `preempt-module`, `start-preempt-helper!`): green-thread preemption must not change results.
      Racket threads are Chez engines (rumble engine.ss); when the engine timer runs out at an event
      check (procedure entry, loop back-edge) the timer interrupt captures the metacontinuation and
@@ -310,6 +310,23 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      count (≈ swaps) to stderr. The repro retries a matching variant run twice (swaps during
      compilation depend on timing). About a fifth of the drawn cases; `macrodump prog.rkt preempt`
      prints the rewrite.
+   - `common`, `noclos`, `notrap`, `dbg`, `noinl`, `chezmix`, `chezmixzo` (option toggles, steering
+     round 10; runner.rkt `set-chez-knobs!`): Chez compiler parameters Racket never changes, so
+     their code paths in the Chez compiler were never exercised. `common`: `commonization-level`
+     1-9 (cpcommonize, merging similar lambdas; CSUG: commonization "should not affect the
+     behavior of the program"); `noclos`: internal `$optimize-closures #f` + `$lift-closures #f`
+     (np-expand-closures instead of np-expand/optimize-closures, no well-known closure lifting);
+     `notrap`: `generate-interrupt-trap #f` (no event-check/trap code in user code; loops are
+     bounded); `dbg`: `debug-level 3` + `generate-inspector-information #t`; `noinl`: internal
+     `$suppress-primitive-inlining #t` (every primitive called out of line instead of the cpprim
+     inline code); half of the programs of each go through `compile` + zo round trip (compile-to-port). All of them also turn on `$enable-check-prelex-flags` (the Chez mats run with it, mats/build.zuo `ecpf`; only effective on the compile-to-port path), Chez's own consistency
+     check of prelex referenced/assigned flags after each front-end pass (a violation raises
+     `Exception in cpcheck-prelex-flags ...`, kind `internal`/`error`). `chezmix` applies a
+     combination of the knobs (plus notr / cp0big), chosen from the program text, to the module
+     unchanged, opaque-rewritten, localpart-rewritten, split, or ctlnoise+split; `chezmixzo` does
+     the same with a zo round trip of each module. `macrodump prog.rkt chezmix` prints the rewrite.
+     Not used: `compile-profile 'block` (no counters without source objects), `$loop-unroll-limit`
+     (np-profile-unroll-loops is "disabled for now" in cpnanopass.ss). About a fifth of the draws.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 
@@ -343,7 +360,7 @@ modes against the given build and exits 1/0/2.
 `server_restarts`, `segments`. `rktgen norm93 prog.rkt < result-lines` prints the ref93
 comparison form.
 
-Check of the ref93 oracle (a trunk build with fixes for the bugs found so far applied, 8 x 700 s + 4 x 500 s): ~28 000 cases, ~4 100 ref93
+Round 7 check (patched base build, 8 x 700 s + 4 x 500 s): ~28 000 cases, ~4 100 ref93
 comparisons, 0 failures; one earlier ref93 finding was a 9.3 bug repaired in trunk (8f67966b14),
 now skipped. On the unpatched trunk the old clusters (composable, splitmi set) still appear
 within minutes.
@@ -365,3 +382,9 @@ statically links the kernel). Profiles of build-time runs go to `<build>/build-p
 Scheme-level code (schemify, expander, the Chez compiler passes where most bugs live) is not visible
 to LLVM coverage; trunk has no Scheme-level coverage counters. A 30 s run reached 39% of
 functions / 29% of lines of the instrumented C.
+
+Round 10 check (a trunk build with fixes for the bugs found so far, 4 x 600 s + 4 x 360 s, ~14 000 cases): 300 sampled programs x 7 knob
+variants gave no differences; the search found 6 `*__internal__*` findings (chezmixzo, notrap,
+common), all the same Chez crash: with `$enable-check-prelex-flags` on, `compile-to-port` of
+`(lambda (t) (real->flonum (+ 5 (length t))))` (also `(inexact (if (fixnum? t) (+ t 1) 1))`)
+dies with "invalid memory reference"; it needs cptypes (`enable-type-recovery #f` avoids it).
