@@ -11,6 +11,7 @@
 //!           timeout (the interpreter finished, so this is a compile hang).
 
 use rktgen::gen;
+use rktgen::num;
 
 use ephyra::{Config, Run, TestResult};
 use gen::{render_program, Program, ProgramGen, E};
@@ -921,6 +922,225 @@ fn write_stats(out: &Path, cases: u64, failures: u64, extra: &BTreeMap<String, u
     std::fs::rename(tmp, out.join("stats.json")).unwrap();
 }
 
+// ---------------------------------------------------------------- numref
+// Oracle `numref` (steering round 14): numeric expression lists checked
+// against racket/numref.py, an independent Python evaluator.  The
+// machine-code server `a` runs the module; numref.py says pass / fail.
+
+struct PyRef { child: Child, stdin: ChildStdin, rx: Receiver<String> }
+
+fn spawn_py(script: &Path) -> PyRef {
+    let mut child = Command::new("python3").arg("-I").arg(script).arg("server")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("python3");
+    let stdin = child.stdin.take().unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for l in BufReader::new(out).lines() {
+            match l { Ok(l) => { if tx.send(l).is_err() { break; } } Err(_) => break }
+        }
+    });
+    PyRef { child, stdin, rx }
+}
+
+impl PyRef {
+    /// numref.py's verdict fields, or None (python died/hung: restarted)
+    fn check(&mut self, script: &Path, prog: &str, line: &str) -> Option<Vec<String>> {
+        let msg = format!("{}\n{}{}\n{}", prog.len(), prog, line.len(), line);
+        let ok = self.stdin.write_all(msg.as_bytes()).and_then(|_| self.stdin.flush()).is_ok();
+        let r = if ok { self.rx.recv_timeout(Duration::from_secs(30)).ok() } else { None };
+        match r {
+            Some(l) => Some(l.split('\t').map(|x| x.to_string()).collect()),
+            None => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                *self = spawn_py(script);
+                None
+            }
+        }
+    }
+}
+
+const REPRO_NUMREF: &str = r#"#!/usr/bin/env bash
+# Repro for signature @SIG@ (oracle numref, kind @KIND@).
+# Runs prog.rkt through runner.rkt with the build's racket (machine code, or the
+# interpreter for kinds ivalue/ierror) and
+# checks every "(o i ...)" line's printed value against numref.py, an
+# independent evaluator (Python int / fractions.Fraction / IEEE doubles).
+# `python3 -I numref.py eval prog.rkt` prints the expected lines.
+# exit 1: failure reproduces; 0: it does not; 2: cannot decide.
+B=$(cd "$1" 2>/dev/null && pwd) || exit 2
+R="$B/src/racket/bin/racket"
+[ -x "$R" ] || exit 2
+command -v python3 >/dev/null || exit 2
+cd "$(dirname "$0")"
+KIND=@KIND@
+# kinds ivalue/ierror: the interpreter's (PLT_CS_INTERP=1) output is the wrong one
+# kinds uvalue/uerror: machine code under runner.rkt variant unsafe ((#%declare #:unsafe)),
+# on lines that raise nothing in safe mode (checked first: else 2)
+case $KIND in
+  u*) s=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=20 timeout -k 5 120 "$R" runner.rkt file prog.rkt none 2>&1)
+      case "$s" in *'err\n'*|*'err"'*) exit 2;; esac
+      a=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=20 timeout -k 5 120 "$R" runner.rkt file prog.rkt unsafe 2>&1); ca=$? ;;
+  i*) a=$(env -u PLT_CS_COMPILE_LIMIT PLT_CS_INTERP=1 RKT_CASE_TIMEOUT=120 timeout -k 5 300 "$R" runner.rkt file prog.rkt none 2>&1); ca=$? ;;
+  *) a=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=20 timeout -k 5 120 "$R" runner.rkt file prog.rkt none 2>&1); ca=$? ;;
+esac
+ra=$(printf '%s\n' "$a" | grep -E $'^(ok|exn|raise|timeout|oom)\t|^oom$' | tail -1)
+if [ "${KIND%died}" != "$KIND" ]; then
+  if [ "$ca" != 0 ] && [ "$ca" != 124 ] && [ "$ca" != 137 ] && [ -z "$ra" ]; then exit 1; fi
+  exit 0
+fi
+[ -z "$ra" ] && exit 2
+printf '%s\n' "$ra" | python3 -I numref.py check prog.rkt >/dev/null
+exit $?
+"#;
+
+struct NumCtx { py: PyRef, script: PathBuf }
+
+/// mode 0: machine code (server a), 1: interpreter (b), 2: machine code
+/// under variant `unsafe` (server c)
+fn num_query(pair: &mut Pair, nc: &mut NumCtx, text: &str, mode: u8) -> (Res, Option<Vec<String>>) {
+    let lim = Duration::from_secs(CASE_TIMEOUT_S + 30);
+    let ok = Res::Line("ok".into());
+    let ra = match mode {
+        0 => { let s = Pair::send(&mut pair.a, text); let r = Pair::recv(&mut pair.a, s, lim); pair.restart_ab(&r, &ok); r }
+        1 => { let s = Pair::send(&mut pair.b, text); let r = Pair::recv(&mut pair.b, s, lim); pair.restart_ab(&ok, &r); r }
+        _ => {
+            let s = Pair::send_v(&mut pair.c, text, "unsafe");
+            let r = Pair::recv(&mut pair.c, s, lim);
+            if !matches!(r, Res::Line(_)) {
+                let _ = pair.c.child.kill();
+                let _ = pair.c.child.wait();
+                pair.c = spawn_server(&pair.racket, &pair.runner, false);
+                pair.restarts += 1;
+            }
+            r
+        }
+    };
+    let v = match &ra { Res::Line(l) => nc.py.check(&nc.script, text, l), _ => None };
+    (ra, v)
+}
+
+/// one numref case; true when a failure was found (and recorded)
+fn numref_case(pair: &mut Pair, nc: &mut NumCtx, rseed: u64, search: &mut Search, extra: &mut BTreeMap<String, u64>) -> bool {
+    let mut g = num::NumGen::new(rseed);
+    let lines: Vec<(usize, num::Line)> = g.program().into_iter().enumerate().collect();
+    let text = num::render_numprog(&lines);
+    // machine code (a) and interpreter (b) in parallel; each checked against numref.py
+    let lim = Duration::from_secs(CASE_TIMEOUT_S + 30);
+    let sa = Pair::send(&mut pair.a, &text);
+    let sb = Pair::send(&mut pair.b, &text);
+    let ra0 = Pair::recv(&mut pair.a, sa, lim);
+    let rb0 = Pair::recv(&mut pair.b, sb, lim);
+    pair.restart_ab(&ra0, &rb0);
+    let va = match &ra0 { Res::Line(l) => nc.py.check(&nc.script, &text, l), _ => None };
+    let vb = match &rb0 { Res::Line(l) => nc.py.check(&nc.script, &text, l), _ => None };
+    let a_fail = matches!(&va, Some(f) if f[0] == "fail");
+    let b_fail = matches!(&vb, Some(f) if f[0] == "fail");
+    let mut mode: u8 = if !a_fail && b_fail && matches!(ra0, Res::Line(_)) { 1 } else { 0 };
+    let (mut ra, mut v) = if mode == 1 { (rb0, vb) } else { (ra0, va) };
+    let mut lines = lines;
+    // unsafe re-run (half the passing cases): the lines that raised nothing
+    // in safe mode, under (#%declare #:unsafe); syntax.scrbl leaves only
+    // evaluations that should have raised exn:fail:contract unspecified
+    if mode == 0 && matches!(&v, Some(f) if f[0] == "pass") && mix(rseed, 5) % 2 == 0 {
+        let errs: Vec<usize> = v.as_ref().unwrap().get(1).map(|e| e.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+        lines.retain(|(i, _)| !errs.contains(i));
+        let t = num::render_numprog(&lines);
+        let (rc, vc) = num_query(pair, nc, &t, 2);
+        *extra.entry("numref_unsafe".into()).or_insert(0) += 1;
+        if matches!(&vc, Some(f) if f[0] == "fail") || matches!(rc, Res::Died(_)) {
+            mode = 2; ra = rc; v = vc;
+        }
+    }
+    let text = num::render_numprog(&lines);
+    *extra.entry("numref_cases".into()).or_insert(0) += 1;
+    match (&ra, &v) {
+        (Res::Died(_), _) => {
+            // a crash on a numeric program: confirm once, then record whole
+            let (rb, _) = num_query(pair, nc, &text, mode);
+            if matches!(rb, Res::Died(_)) {
+                search.record_num(&text, if mode == 2 { "udied" } else { "died" }, "program", &res_text(&rb), &format!("{rseed}"));
+                return true;
+            }
+            *extra.entry("numref_died_flaky".into()).or_insert(0) += 1;
+            false
+        }
+        (Res::Hung, _) => { *extra.entry("numref_hung".into()).or_insert(0) += 1; false }
+        (_, None) => { *extra.entry("numref_py_lost".into()).or_insert(0) += 1; false }
+        (Res::Line(_), Some(f)) => match f[0].as_str() {
+            "pass" => { *extra.entry("numref_pass".into()).or_insert(0) += 1; false }
+            "skip" => { *extra.entry("numref_skip".into()).or_insert(0) += 1; false }
+            "gen" => {
+                *extra.entry("numref_gen_errors".into()).or_insert(0) += 1;
+                if std::env::var("RKTGEN_NUM_DEBUG").is_ok() { eprintln!("numref gen: {:?}\n{text}", f); }
+                false
+            }
+            "fail" => {
+                let kind: &'static str = match (mode, f[1] == "error") {
+                    (0, true) => "error", (0, false) => "value", (1, true) => "ierror", (1, false) => "ivalue",
+                    (_, true) => "uerror", (_, false) => "uvalue" };
+                let pk: &str = if f[1] == "error" { "error" } else { "value" };
+                let idx: usize = f[2].parse().unwrap_or(0);
+                let Some(pos) = lines.iter().position(|(i, _)| *i == idx) else { return false };
+                // shrink: the failing line alone, then greedy one-step simplifications
+                let mut cur = lines[pos].1.clone();
+                let one = num::render_numprog(&[(idx, cur.clone())]);
+                let (r1, v1) = num_query(pair, nc, &one, mode);
+                let still = |v: &Option<Vec<String>>| matches!(v, Some(f) if f[0] == "fail" && f[1] == pk);
+                let shrinkable = still(&v1);
+                let (mut best_text, mut best_r, mut best_v) = if shrinkable { (one, r1, v1) } else { (text.clone(), ra.clone(), v.clone()) };
+                if shrinkable {
+                    let mut steps = 0;
+                    'outer: while steps < 120 {
+                        for c in num::shrink_candidates(&cur) {
+                            steps += 1;
+                            if steps >= 120 { break 'outer; }
+                            let t = num::render_numprog(&[(idx, c.clone())]);
+                            if t.len() >= best_text.len() { continue; }
+                            let (rc, vc) = num_query(pair, nc, &t, mode);
+                            if still(&vc) {
+                                cur = c; best_text = t; best_r = rc; best_v = vc;
+                                continue 'outer;
+                            }
+                        }
+                        break;
+                    }
+                }
+                let bv = best_v.unwrap();
+                let area = bv.get(3).cloned().unwrap_or_else(|| "num".into());
+                let msg = format!("{}\n{}: {}", bv.get(4).cloned().unwrap_or_default(), ["machine-code", "interpreter (PLT_CS_INTERP=1)", "machine-code, (#%declare #:unsafe)"][mode as usize], res_text(&best_r));
+                *extra.entry(format!("fail_numref_{kind}")).or_insert(0) += 1;
+                search.record_num(&best_text, kind, &area, &msg, &format!("{rseed}"));
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+impl Search {
+    fn record_num(&mut self, prog: &str, kind: &str, area: &str, msg: &str, seed_label: &str) {
+        let sig = format!("numref__{kind}__{area}");
+        let cnt = self.per_sig.entry(sig.clone()).or_insert(0);
+        if *cnt >= 3 { return; }
+        *cnt += 1;
+        let dir = self.out.join("findings").join(&sig).join(cnt.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("prog.rkt"), prog).unwrap();
+        std::fs::copy(&self.runner_src, dir.join("runner.rkt")).unwrap();
+        std::fs::copy(self.runner_src.with_file_name("numref.py"), dir.join("numref.py")).unwrap();
+        std::fs::write(dir.join("results.txt"), msg).unwrap();
+        let fj = format!("{{\"signature\": {}, \"oracle\": \"numref\", \"message\": {}, \"seed\": {}}}\n",
+                         json_str(&sig), json_str(&msg.chars().take(3000).collect::<String>()), json_str(seed_label));
+        std::fs::write(dir.join("finding.json"), fj).unwrap();
+        let rp = dir.join("repro.sh");
+        std::fs::write(&rp, REPRO_NUMREF.replace("@SIG@", &sig).replace("@KIND@", kind)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&rp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -932,6 +1152,12 @@ fn main() {
                 let p = ephyra::Gen::generate(&ProgramGen, &mut src);
                 println!(";; case {seed}:{i}\n{}", render_program(&p.0));
             }
+        }
+        Some("numsample") => {
+            let seed: u64 = args[2].parse().unwrap();
+            let mut g = num::NumGen::new(seed);
+            let lines: Vec<(usize, num::Line)> = g.program().into_iter().enumerate().collect();
+            print!("{}", num::render_numprog(&lines));
         }
         Some("norm93") => {
             // rktgen norm93 <prog.rkt>: result lines on stdin -> ref93 comparison form
@@ -958,6 +1184,8 @@ fn main() {
             let variant: std::cell::Cell<&'static str> = std::cell::Cell::new(VARIANTS[0]);
             let mut search = Search { out: out.clone(), runner_src: runner, per_sig: HashMap::new(), shrinks_per_kind: HashMap::new() };
             let mut extra: BTreeMap<String, u64> = BTreeMap::new();
+            let pyscript = build.join("harness/numref.py");
+            let mut numctx = if pyscript.exists() { Some(NumCtx { py: spawn_py(&pyscript), script: pyscript.clone() }) } else { None };
             let (mut cases, mut failures) = (0u64, 0u64);
             let mut last_write = Instant::now();
             write_stats(&out, 0, 0, &extra, 0.0);
@@ -999,6 +1227,19 @@ fn main() {
                 let mut run = Run::new(&cfg, ProgramGen, &property);
                 let mut failed: Option<(Program, Verdict, Res, Res, Option<Res>, u64)> = None;
                 while run.wants_more() && Instant::now() < deadline {
+                    // numref (steering round 14): a fifth of the cases, outside ephyra
+                    if let Some(nc) = numctx.as_mut() {
+                        if mix(seed, 9_100_000 + cases) % 5 == 0 {
+                            let failed = numref_case(&mut pair.borrow_mut(), nc, mix(seed, 9_200_000 + cases), &mut search, &mut extra);
+                            cases += 1;
+                            if failed { failures += 1; }
+                            if last_write.elapsed() > Duration::from_secs(5) {
+                                last_write = Instant::now();
+                                write_stats(&out, cases, failures, &extra, cases as f64 / t0.elapsed().as_secs_f64());
+                            }
+                            continue;
+                        }
+                    }
                     let Some(input) = run.draw() else { continue };
                     let iter = input.iteration();
                     // one variant per drawn case; unchanged while it is shrunk

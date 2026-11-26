@@ -460,6 +460,62 @@ written as a finding (max 3 per signature, max 40 shrinks per oracle kind per ru
 starts with a derived seed. `repro.sh` runs `prog.rkt` through its own copy of `runner.rkt` in both
 modes against the given build and exits 1/0/2.
 
+4. **numref** (`numref__{value,error,ivalue,ierror,uvalue,uerror,died,udied}__<op>`, steering round 14):
+   an independent second reference for the numeric library both trunk modes share. Every
+   oracle above compares Racket with Racket, so a wrong result computed by code that machine
+   code and the interpreter both call (Chez's C `number.c` bignum arithmetic, `mathprims.ss`/
+   `5_3.ss` rationals and `exact->inexact`, the library procedures `flround`/`flmin`/`flmax`/
+   `fxpopcount`/`flsingle`/`flbit-field` compiled with the same new cpprim inlines, the fixnum
+   wraparound ops, `integer->integer-bytes`, `number->string`/`string->number` in radix 2/8/16)
+   is invisible to them. A fifth of the cases (`mix(seed, 9_100_000 + case) % 5 == 0`, outside
+   ephyra) are numref programs from `gen/src/num.rs`: a module with 16-31 lines
+   `(o i (lambda () e))`, `e` a typed expression (fixnum / exact integer incl. bignums up to
+   ~1100 bits / exact rational / flonum / boolean / string; depth 1-4) over those operations,
+   mixed exact-inexact comparisons (numbers.scrbl `=`: "An inexact number is numerically equal to
+   an exact number when the exact coercion of the inexact number is the exact number"), bounded
+   named-let accumulation loops (unboxed flonum/fixnum locals), `if`, literal pools with edge
+   values (fixnum bounds, 2^53+-1, 2^1024-2^970, subnormals, FLT_MAX rounding boundaries) and
+   exact values at or next to binary64 rounding ties in the normal, subnormal and overflow
+   ranges. Leaves are wrapped in `(q x)` (identity hidden behind `set!`: no constant folding)
+   with a per-line probability 0/0.3/0.7/1, and in 35% of the lines the leaves become
+   parameters of a module-level `(define (fnI p...) e)` (machine code with unknown arguments).
+   A quarter of the lines whose operations all exist in Chez Scheme are compiled by the Chez
+   compiler directly, `(o i (vm-eval '(lambda () e')))` (ffi/unsafe/vm; `e'` with Chez names:
+   `fxsll`/`fxsra`/`fxsrl`, `flonum->fixnum`, `isqrt`, `bitwise-arithmetic-shift`, ...,
+   `numref-q` a Chez top-level identity): no schemify, Chez's own cp0 folding of `mifoldable`
+   primitives, and the Chez-only primitives `flfma` (native FMA, 3605290b08) and `flnextafter`
+   (c39f716310) inline; Racket lines reach them through prelude bindings. numref.py maps the
+   names back (`from_chez`).
+   `o` prints `i <enc>` (`#t`/`#f`, `e<exact>`, `f<exact value of the flonum>`, `-0`, `nan`,
+   `+inf`, `-inf`, `s<string>`, or `err` when `exn:fail` was raised; strings over 120 chars
+   abbreviated to head~length~tail, since runner.rkt caps the output).
+   `racket/numref.py` (stdlib only: int, fractions.Fraction, IEEE doubles, ctypes float for
+   `flsingle`) parses the same text and evaluates every line by the documented semantics
+   (truncating quotient/remainder, floor modulo, round-half-even, IEEE rounding with the sign of
+   zero kept, `gcd`/`lcm` of rationals as numbers.scrbl says, fixnum ops raising
+   non-fixnum-result outside [-2^60, 2^60), `/wraparound` modulo 2^61, flmin/flmax returning the
+   second of 0.0 and -0.0 (05afec9201) and NaN when any argument is NaN). Lines whose result is
+   not specified (inexact `sqrt`, the bits of a NaN, NaN bytes read with the other endianness)
+   are not compared. Machine code (server a) and the interpreter (server b) both run the module
+   and are both checked; for half the passing cases the lines that raised nothing are re-run
+   under variant `unsafe` (server c; only evaluations that should raise are unspecified there).
+   On a mismatch the failing line alone is re-checked and greedily simplified (replace a node by a
+   same-typed child, drop `q`, inline the function), up to 120 steps. Kinds: `value`/`error`
+   machine code wrong, `ivalue`/`ierror` interpreter wrong (machine code right), `uvalue`/
+   `uerror` unsafe machine code wrong, `died`/`udied` the server died twice on the program.
+   `<op>` = the first primitive of the shrunk expression (in preorder), e.g. `fxpopcount`,
+   `exact-to-inexact`. Repro: `repro.sh` runs `runner.rkt file prog.rkt` (mode by kind) and
+   pipes the result line into `python3 -I numref.py check prog.rkt` (exit 1 mismatch, 0 match, 2
+   undecidable); `python3 -I numref.py eval prog.rkt` prints the expected lines,
+   `rktgen numsample <seed>` prints a program. Expected behaviour: the documented semantics
+   quoted in numref.py; `exact->inexact` is checked as correctly rounded (R6RS `inexact`:
+   "the numerically closest inexact number", which Chez implements; Racket only says
+   "Coerces") — treat a mismatch there as a watch item until the closest-value claim is
+   confirmed. Stats: `numref_cases`, `numref_pass`, `numref_unsafe`, `numref_skip`,
+   `numref_gen_errors` (module raised or a line is missing: generator bug, should stay 0),
+   `numref_py_lost`, `fail_numref_*`. Before round 14, 2400 programs (~60 000 expressions) passed
+   on trunk+patches.
+
 ## Masked differences (each counted in stats.json)
 
 - `masked_nonfx_msg`: the message of `exn:fail:contract:non-fixnum-result` differs by mode:
