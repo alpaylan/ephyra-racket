@@ -426,6 +426,27 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      importing a module's known bindings). `macrodump prog.rkt top` prints the forms. About 1/7 of
      the draws. First probe (300 programs x 3 on trunk): one difference, the known
      unboxed-`fl+` composable-continuation bug (the module side is the wrong one).
+     For half of the programs every function definition `(define (f ...) ...)` is also evaluated
+     a second time, unchanged, at a later position (the top level allows redefinition, a lambda
+     definition has no other effect, so callers compiled earlier — or in the same compiled begin —
+     must see an equivalent procedure: no stale known-procedure or inlining assumptions).
+   - `rtrip`, `rtripzo` (run-time round trips, steering round 13; runner.rkt `rt-module`,
+     `rt-defs`): the opaque sites are wrapped in `(rt-v e)`, which returns e's value unchanged
+     after checking documented round trips on it: `write` then `read` gives an `equal?` value
+     (printer.scrbl: "write mode prints core datatypes in such a way that using read on the output
+     produces a value that is equal? to the printed value"; only trees of numbers, strings, byte
+     strings, chars, interned symbols, keywords, booleans, `'()`, pairs, vectors);
+     `s-exp->fasl`/`fasl->s-exp` with `#:keep-mutable? #t` (also boxes and hash tables; in
+     eq?/eqv?/equal-always? tables only keys whose identity a copy keeps: fixnums, chars, booleans,
+     symbols, keywords, and numbers for eqv?) gives an `equal?` value; `number->string` /
+     `string->number` (radix 10, and 2/8/16 for exact numbers) gives an `eqv?` number;
+     `equal-hash-code` (and `eqv-hash-code` for numbers) of v and of each copy agree
+     (equality.scrbl: "For any two calls with equal? values, the returned number is the same");
+     an immutable hash rebuilt in reverse insertion order is `equal?` with the same hash code. A
+     violation raises `rt-v: internal error: round trip <what>: <v> -> <copy>` (kind `internal`).
+     First 3000 sites per case, values written in under 20 000 chars. `rtripzo` = + zo round trip.
+     About 1/14 of the draws. Probes: 950 programs x 2 clean after restricting non-equal? table
+     keys (a copied mutable-string key is a new object for eqv?, correctly not `equal?`).
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

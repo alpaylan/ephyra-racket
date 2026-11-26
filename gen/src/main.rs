@@ -133,7 +133,7 @@ const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big
                             "local", "localpart", "localzo", "preempt", "preemptctl", "preemptsplit",
                             "common", "noclos", "notrap", "dbg", "noinl", "chezmix", "chezmixzo",
                             "future", "futurezo", "futuresplit", "gcfuture", "port", "portsplit",
-                            "top", "topzo", "topsplit"];
+                            "top", "topzo", "topsplit", "rtrip", "rtripzo"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -184,7 +184,11 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "top", "top", "topzo", "topzo", "topzo", "topzo", "topzo", "topzo",
                                 "topzo", "topzo", "topzo", "topzo", "topsplit", "topsplit", "topsplit",
                                 "topsplit", "topsplit", "topsplit", "topsplit", "topsplit", "topsplit",
-                                "topsplit"];
+                                "topsplit",
+                                // steering round 13: write/read, fasl, number->string and
+                                // equal-hash-code round trips checked at the opaque sites
+                                "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip",
+                                "rtripzo", "rtripzo", "rtripzo", "rtripzo", "rtripzo", "rtripzo"];
 
 /// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
 /// in 9.3: a case using one is not sent to the 9.3 server.
