@@ -587,6 +587,15 @@ fn classify_ref93(a: &Res, c: &Res, prog: &str) -> Verdict {
     if prog.contains("expt") && prog.contains("-1152921504606846976") {
         return Verdict::Skip("ref93_known_expt");
     }
+    // ad7cb98405 (9.3 bug repaired in trunk): `file-position` past the end
+    // of a byte-string output port grew the buffer only by doubling, so 9.3's
+    // `get-output-bytes` copies from past the byte string (heap garbage).
+    // Reference, port-buffers.scrbl: "the file/string is enlarged to size
+    // pos and the new region is filled with 0 bytes". Only programs that set
+    // the position of an output string port are skipped.
+    if prog.contains("(file-position ") && (prog.contains("open-output-bytes") || prog.contains("open-output-string")) {
+        return Verdict::Skip("ref93_known_file_position");
+    }
     if kind_of(la) != kind_of(lc) || (kind_of(la) == "exn" && na.split('\t').nth(2) != nc.split('\t').nth(2)) {
         return Verdict::Fail("ref93", "error");
     }
