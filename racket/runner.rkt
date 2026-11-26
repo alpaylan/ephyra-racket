@@ -1033,9 +1033,30 @@
 (define (pa:csize i) (vector-ref '#(1 3 100000 2 1 7 4096 5) (modulo i 8)))
 (define (pa:valid-utf-8? b) (and (bytes-utf-8-length b #f) #t))
 (define pa:tmp-k 0)
+;; temp-dir is "the first path that exists among /var/tmp, /usr/tmp, and
+;; /tmp" when TMPDIR is unset (filesystem.scrbl), whether or not it is
+;; writable; in a sandbox /var/tmp can exist read-only (triage
+;; port-error-letrec-loop: open-output-file failed on every file port).
+;; Use the first candidate where a file can actually be created.
+(define pa:tmp-dir #f)
+(define (pa:find-tmp-dir)
+  (or pa:tmp-dir
+      (let loop ([ds (list (find-system-path 'temp-dir) (string->path "/tmp")
+                           (current-directory))])
+        (cond
+          [(null? ds) (find-system-path 'temp-dir)]
+          [(with-handlers ([exn:fail? (lambda (e) #f)])
+             (let ([p (build-path (car ds) (format "rktpa-probe-~a-~a" (current-inexact-milliseconds)
+                                                   (eq-hash-code (box 0))))])
+               (call-with-output-file p void #:exists 'truncate)
+               (with-handlers ([exn:fail? void]) (delete-file p))
+               #t))
+           (set! pa:tmp-dir (car ds))
+           pa:tmp-dir]
+          [else (loop (cdr ds))]))))
 (define (pa:tmp-path)
   (set! pa:tmp-k (add1 pa:tmp-k))
-  (build-path (find-system-path 'temp-dir)
+  (build-path (pa:find-tmp-dir)
               (format "rktpa-~a-~a-~a" (current-inexact-milliseconds) (eq-hash-code (box 0)) pa:tmp-k)))
 (define (pa:custom-in b peek? start)
   (define pos 0)
