@@ -473,6 +473,16 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (`ch-v: internal error: ...`, kind `internal`). `chapzo` = + zo round trip, `chapsplit` =
      split + zo round trip of each module. About 1/8 of the draws. `macrodump prog.rkt chap`
      prints the rewrite. `RKTGEN_VARIANTS=chap,chapzo` (comma list) restricts the draw for probes.
+     The generator's `lib_collop` got two templates whose library procedures have impersonator
+     paths: `vector-copy!` (also overlapping, same vector), `vector->values`, `list->vector`, and
+     `make-hash` from an assoc list, `hash-copy`, `hash-ref-key`, `hash-map/copy`, `hash-clear!`.
+     First probes (a trunk build with fixes for the bugs found so far, 4 x 240 s, chap only): ~0.5% failures, all one real bug:
+     `vector-fill!` on a chaperoned mutable vector raises "contract violation ... given: <fill
+     value>" (rumble/vector.ss checks the fill value instead of the vector; also 9.3). Seen by hand
+     while debugging the check (not yet hit by the generator: it only reaches keyword procedures
+     through `sort`): `impersonate-procedure` of a keyword procedure with an impersonator property
+     answers `chaperone?` #t but `chaperone-of?` #f, and without a property `impersonator?` #f
+     (also 9.3).
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

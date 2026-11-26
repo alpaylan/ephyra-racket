@@ -1393,7 +1393,7 @@ impl<'a> Gen<'a> {
     /// Lists, sorting, hash tables.
     fn lib_collop(&mut self, d: usize) -> E {
         let h = self.fresh("h");
-        match self.rng.below(10) {
+        match self.rng.below(12) {
             0 | 1 => { let l = self.lib_numlist(d); let op: &str = self.rng.pick(&["(sort (filter real? $0) <)", "(sort (filter real? $0) >=)", "(sort (map number->string $0) string<?)", "(foldl cons '() $0)", "(map (lambda (x) (* x x)) $0)", "(assv 1/3 (map (lambda (x) (cons x x)) $0))", "(member 2.0 $0)", "(memv 0 $0)", "(list-tail $0 1)", "(filter exact? $0)", "(foldr (lambda (x a) (+ x a)) 0 $0)", "(remove 1/3 $0)"]); E::node(Ty::Val, "lib-list", &op, vec![l]) }
             2 => { let a = self.lib_str(d); let b = self.lib_str(d); let c = self.lib_str(d); E::node(Ty::Val, "lib-list", "(sort (list $0 $1 $2) string-ci<?)", vec![a, b, c]) }
             3 | 4 | 5 => {
@@ -1408,6 +1408,10 @@ impl<'a> Gen<'a> {
                 E::node(Ty::Val, "lib-hash", &format!("(let* ([{h} (hash-set (hash-set {mk} $0 1) $1 2)] [r (hash-remove {h} $2)]) (list (hash-count {h}) (hash-count r) (hash-ref r $0 'none) (equal? {h} (hash-set (hash-set {mk} $1 2) $0 1)) (hash-has-key? r $1)))"), vec![k1, k2, k3])
             }
             8 => { let a = self.lib_any(d); let b = self.lib_any(d); E::node(Ty::Val, "lib-list", "(let ([v (vector $0 $1 $0)]) (vector-fill! v $1) (list (vector->list v) (vector->immutable-vector v) (equal? v (vector $1 $1 $1))))", vec![a, b]) }
+            // steering round 15: vector/hash library procedures with impersonator
+            // paths (the chap variants pass chaperoned vectors and tables to them)
+            10 => { let a = self.lib_any(d); let b = self.lib_any(d); let c = self.lib_any(d); E::node(Ty::Val, "lib-list", "(let ([v (vector $0 $1 $2)] [u (make-vector 4 $1)]) (vector-copy! u 1 v 0 2) (vector-copy! v 0 v 1) (list (vector->list u) (vector->list v) (call-with-values (lambda () (vector->values u 1 3)) list) (vector->immutable-vector v) (vector-length (list->vector (vector->list u)))))", vec![a, b, c]) }
+            11 => { let a = self.lib_any(d); let b = self.lib_any(d); let c = self.lib_any(d); E::node(Ty::Val, "lib-hash", &format!("(let* ([{h} (make-hash (list (cons $0 1) (cons $1 2)))] [c (hash-copy {h})]) (hash-set! c $2 3) (list (hash-count {h}) (hash-count c) (hash-ref-key c $1 'none) (sort (hash-values (hash-map/copy c (lambda (k x) (values k (* x 10))))) <) (begin (hash-clear! c) (hash-count c)) (hash-count {h})))"), vec![a, b, c]) }
             _ => { let a = self.lib_any(d); let b = self.lib_any(d); E::node(Ty::Val, "lib-list", "(list (equal? $0 $1) (equal? (list $0) (list $1)) (eqv? $0 $0))", vec![a, b]) }
         }
     }
