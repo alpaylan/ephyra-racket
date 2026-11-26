@@ -566,8 +566,10 @@ modes against the given build and exits 1/0/2.
    `regexp-match-positions`, the same on an input port, `regexp-match-peek-positions`,
    `regexp-match`, `regexp-match` on a port (bytes results), `regexp-match-positions*` on the
    value and on a port, `regexp-split`, `regexp-replace*` / `regexp-replace` with a template of
-   literals, `&` and `\N`, `regexp-match?`, `regexp-quote` of the input matching itself, and
-   (string mode) the string regexp on the UTF-8 bytes. rxref.py translates the AST into a
+   literals, `&` and `\N`, `regexp-match?`, `regexp-quote` of the input matching itself, `regexp-match-exact?`, `regexp-match-positions`
+   with an output port (start-pos 0: with a positive start-pos Racket writes from start-pos while
+   the docs say "from its beginning (not start-pos)", same in 9.3; left out), `#:match-select
+   values`, and (string mode) the string regexp on the UTF-8 bytes. rxref.py translates the AST into a
    Python `re` pattern that spells out Racket's documented semantics (rx.rkt grammar:
    `\w`/`\d`/`\s`/POSIX classes are ASCII, `.` matches newline outside multi mode, `$` is the
    end, `(?m:` = `(?-s:` multi mode; `\p{..}` becomes the class of pool characters in that
@@ -583,7 +585,7 @@ modes against the given build and exits 1/0/2.
    (`lookbehind`, `cond`, `bref`, `casei`, ...). On a failure rxref.py proposes one-line
    simplifications (single call, no start/prefix, subtree replaced by a child or `a`, input
    characters dropped), kept while kind and area stay the same (<= 200 runs). Once a signature
-   has its 3 cases, later hits are only counted (`rxref_dup`), not shrunk or counted as failures.
+   has 2 cases (`RXREF_CAP`), later hits are only counted (`rxref_dup`), not shrunk or counted as failures.
    Repro: `repro.sh` runs `runner.rkt file prog.rkt none` and pipes the result into
    `python3 -I rxref.py check prog.rkt` (each line's spec is the JSON in its `;; RX` comment);
    `python3 -I rxref.py eval prog.rkt` prints the expected values, `rktgen rxsample <build>

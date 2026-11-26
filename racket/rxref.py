@@ -43,9 +43,10 @@ POSIX = {'alpha': 'a-zA-Z', 'upper': 'A-Z', 'lower': 'a-z', 'digit': '0-9',
          'ascii': '\\x00-\\x7f', 'graph': '!-~', 'print': ' \\t!-~'}
 KCLS = {'d': '0-9', 'w': 'a-zA-Z0-9_', 's': ' \\t\\n\\f\\r'}
 WORD = '[a-zA-Z0-9_]'
-OPS_B = ['pos', 'port', 'peek', 'match', 'all', 'allport', 'split', 'repl', 'repl1', 'test', 'quote', 'portmatch']
+OPS_B = ['pos', 'port', 'peek', 'match', 'all', 'allport', 'split', 'repl', 'repl1', 'test', 'quote', 'portmatch',
+         'exact', 'outport', 'allg']
 OPS_S = ['pos', 'port', 'peek', 'match', 'all', 'allport', 'split', 'repl', 'repl1', 'test', 'quote',
-         'utf8', 'portmatch']
+         'utf8', 'portmatch', 'exact', 'outport', 'allg']
 
 
 def all_chars(mode):
@@ -450,6 +451,9 @@ def render_line(sp):
         'quote': '(regexp-match-positions (regexp-quote in) in)' if mode == 'b' else
                  '(regexp-match-positions (regexp (regexp-quote in)) in)',
         'utf8': '(regexp-match-positions (R rx) (string->bytes/utf-8 in) %d %s #f pre)' % (bst, bens),
+        'exact': '(regexp-match-exact? (R rx) in)',
+        'outport': '(let ([op (open-output-bytes)]) (list (regexp-match-positions (R rx) in 0 %s op pre) (get-output-bytes op)))' % (ens,),
+        'allg': '(regexp-match-positions* (R rx) in %d %s pre #:match-select values)' % (st, ens),
     }
     for op in sp['ops']:
         L.append('  (o "%d.%s" (lambda () %s))\n' % (i, op, body[op]))
@@ -653,6 +657,18 @@ def expected(sp):
     m1 = rx.search(full, 0)
     E['repl1'] = enc(subst([m1] if m1 else []))
     E['quote'] = enc([(0, len(inp))])
+    # regexp-match-exact?: #t only when the first found match is the entire input
+    mx = rx.search(full, 0)
+    E['exact'] = enc(mx is not None and mx.span() == (0, len(full)))
+    # output-port: the input from its beginning (not start-pos) preceding the match,
+    # or all of it up to end-pos when there is no match (UTF-8 for strings)
+    # (start-pos 0 only: with a positive start-pos Racket writes from start-pos, while the
+    # docs say "from its beginning (not start-pos)"; 9.3 does the same; left out)
+    text0 = pre + inp[:en]
+    m0 = rx.search(text0, lp)
+    upto = inp[:m0.start() - lp] if m0 is not None else inp[:en]
+    E['outport'] = enc([positions(m0, lambda p: p - lp), upto if mode == 'b' else upto.encode()])
+    E['allg'] = enc([positions(x, tpos) for x in ms])
     return E
 
 

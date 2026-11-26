@@ -1159,6 +1159,9 @@ impl PyRef {
     }
 }
 
+/// cases recorded per rxref signature (one known bug hits ~10% of rxref cases)
+const RXREF_CAP: usize = 2;
+
 struct RxCtx { py: PyRef, script: PathBuf }
 
 impl RxCtx {
@@ -1242,8 +1245,8 @@ fn rxref_case(pair: &mut Pair, rc: &mut RxCtx, rseed: u64, search: &mut Search, 
                 let area = f[3].clone();
                 let sig = format!("rxref__{kind}__{area}");
                 *extra.entry(format!("fail_rxref_{kind}")).or_insert(0) += 1;
-                if search.per_sig.get(&sig).copied().unwrap_or(0) >= 3 {
-                    // a signature already recorded 3 times: counted, not re-shrunk
+                if search.per_sig.get(&sig).copied().unwrap_or(0) >= RXREF_CAP {
+                    // a signature already recorded RXREF_CAP times: counted, not re-shrunk
                     *extra.entry("rxref_dup".into()).or_insert(0) += 1;
                     return false;
                 }
@@ -1280,7 +1283,7 @@ impl Search {
     fn record_rx(&mut self, prog: &str, kind: &str, area: &str, msg: &str, seed: u64) {
         let sig = format!("rxref__{kind}__{area}");
         let cnt = self.per_sig.entry(sig.clone()).or_insert(0);
-        if *cnt >= 3 { return; }
+        if *cnt >= RXREF_CAP { return; }
         *cnt += 1;
         let dir = self.out.join("findings").join(&sig).join(cnt.to_string());
         std::fs::create_dir_all(&dir).unwrap();
