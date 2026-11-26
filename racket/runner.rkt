@@ -1036,7 +1036,8 @@
 ;; temp-dir is "the first path that exists among /var/tmp, /usr/tmp, and
 ;; /tmp" when TMPDIR is unset (filesystem.scrbl), whether or not it is
 ;; writable; in a sandbox /var/tmp can exist read-only (triage
-;; port-error-letrec-loop: open-output-file failed on every file port).
+;; port-error-letrec-loop, port__error__lib-print: open-output-file failed
+;; on every file port).
 ;; Use the first candidate where a file can actually be created.
 (define pa:tmp-dir #f)
 (define (pa:find-tmp-dir)
