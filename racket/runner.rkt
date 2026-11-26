@@ -1155,7 +1155,8 @@
 (define port-renames
   '((open-input-bytes . pa:open-input-bytes) (open-input-string . pa:open-input-string)
     (open-output-bytes . pa:open-output-bytes) (open-output-string . pa:open-output-string)
-    (get-output-bytes . pa:get-output-bytes) (get-output-string . pa:get-output-string)))
+    (get-output-bytes . pa:get-output-bytes) (get-output-string . pa:get-output-string)
+    (port-next-location . pa:port-next-location)))
 (define (port-variant? v) (member v '("port" "portsplit")))
 (define (port-module form src)
   (define rng (macro-rng (string-append "port" src)))
@@ -1293,9 +1294,29 @@
   ;; racket/port's *-evt procedures: "The in must support progress events"
   ;; (port-lib.scrbl); a custom port with a peek procedure but no progress
   ;; events, or input-port-append, does not
-  (if (and pa:progress? (not (port-provides-progress-evts? p)))
-      (open-input-bytes b* name)
-      p))
+  (define r
+    (if (and pa:progress? (not (port-provides-progress-evts? p)))
+        (open-input-bytes b* name)
+        p))
+  (hash-set! pa:alt-in r #t)
+  r)
+;; port-next-location on a closed port: ports.scrbl only says that reading
+;; or writing a closed port raises exn:fail ("For any kind of port, after it
+;; is closed, attempting to read from or write to the port raises
+;; exn:fail"); whether port-next-location raises is unspecified and depends
+;; on the kind (io/port/count.rkt checks closed only for ports with line
+;; counting or a file-position method: string/file ports raise, pipes and
+;; custom ports return a position).  The replaced port behaves like the
+;; string port it stands for: a closed string port of the same direction.
+(define pa:alt-in (make-weak-hasheq))
+(define (pa:port-next-location p)
+  (if (and (port? p) (port-closed? p)
+           (or (hash-ref pa:alt-in p #f) (hash-ref pa:getters p #f)))
+      (port-next-location
+       (if (input-port? p)
+           (let ([q (open-input-bytes #"")]) (close-input-port q) q)
+           (let ([q (open-output-bytes)]) (close-output-port q) q)))
+      (port-next-location p)))
 (define (pa:open-kind k b* name)
   (case k
     [(0) (open-input-bytes b* name)]
