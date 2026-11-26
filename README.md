@@ -562,7 +562,9 @@ modes against the given build and exits 1/0/2.
    unbounded repeat under another one), alternation, groups, `(?i:` `(?-i:` `(?m:` `(?s:` ...
    modes, lookahead, fixed-width lookbehind, atomic groups, back references, `(?(N)..|..)`) on
    a byte string (`byte-pregexp`) or a string (`pregexp`), with an input built partly from strings
-   the pattern matches, an optional start / end position and input prefix. Each line runs
+   the pattern matches, an optional start / end position and input prefix; 12% of the lines get a long input (~1000-8200
+   characters of filler around it, so the port matcher refills its buffers) and only the calls
+   with small results. Each line runs
    `regexp-match-positions`, the same on an input port, `regexp-match-peek-positions`,
    `regexp-match`, `regexp-match` on a port (bytes results), `regexp-match-positions*` on the
    value and on a port, `regexp-split`, `regexp-replace*` / `regexp-replace` with a template of

@@ -528,6 +528,14 @@ def gen_line(r, i):
     codes = codes[:28]
     if r.random() < 0.3 and codes:  # mutate
         k = r.randrange(len(codes)); codes[k] = r.choice(all_chars(mode))
+    ops = list(OPS_B if mode == 'b' else OPS_S)
+    if r.random() < 0.12:
+        # long input: the port matcher's buffer refills / lazy peeking (inputs above are tiny);
+        # only calls whose results stay small
+        fill = [r.choice(all_chars(mode)) for _ in range(r.randint(1, 4))]
+        k = r.choice([1000, 2040, 4090, 4100, 8200]) // max(1, len(fill))
+        codes = fill * k + codes if r.random() < 0.7 else codes + fill * k
+        ops = [o for o in ops if o in ('pos', 'port', 'peek', 'test', 'utf8', 'exact')]
     n = len(codes)
     st = 0 if r.random() < 0.6 else r.randint(0, n)
     en = None if r.random() < 0.7 else r.randint(st, n)
@@ -538,7 +546,6 @@ def gen_line(r, i):
         if y < 0.4: tmpl.append(r.choice(['<', '>', 'q', '-', '']))
         elif y < 0.6: tmpl.append('&')
         else: tmpl.append(r.randint(0, ng + 1))
-    ops = list(OPS_B if mode == 'b' else OPS_S)
     return {'i': i, 'mode': mode, 'ast': ast, 'in': codes, 'st': st, 'en': en, 'pre': pre, 'tmpl': tmpl, 'ops': ops}
 
 
@@ -855,13 +862,19 @@ def shrink(text, idx, bad_ops=None):
     for v in tree_variants(sp['ast']):
         add(dict(sp, ast=v))
     n = len(sp['in'])
-    for k in range(n):
+    if n > 40:
+        h = n // 2
+        for c, d in ((sp['in'][h:], h), (sp['in'][:h], 0)):
+            st = max(0, min(len(c), sp['st'] - d))
+            en = None if sp['en'] is None else max(st, min(len(c), sp['en'] - d))
+            add(dict(sp, **{'in': c, 'st': st, 'en': en}))
+    for k in range(n if n <= 40 else 0):
         c = sp['in'][:k] + sp['in'][k + 1:]
         st = min(sp['st'], len(c)) if k >= sp['st'] else max(0, sp['st'] - 1)
         en = sp['en']
         if en is not None: en = max(st, en - 1) if k < en else min(en, len(c))
         add(dict(sp, **{'in': c, 'st': st, 'en': en}))
-    for k in range(n):
+    for k in range(n if n <= 40 else 0):
         if sp['in'][k] != ord('a'):
             c = list(sp['in']); c[k] = ord('a'); add(dict(sp, **{'in': c}))
     return [render_prog([dict(c, i=0)]) for c in cands]
