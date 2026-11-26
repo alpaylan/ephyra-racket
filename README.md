@@ -447,6 +447,32 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      First 3000 sites per case, values written in under 20 000 chars. `rtripzo` = + zo round trip.
      About 1/14 of the draws. Probes: 950 programs x 2 clean after restricting non-equal? table
      keys (a copied mutable-string key is a new object for eqv?, correctly not `equal?`).
+   - `chap`, `chapzo`, `chapsplit` (metamorphic, steering round 15; runner.rkt `ch-module`,
+     `ch-defs`): the opaque sites are wrapped in `(ch-v e)`, which returns e's value inside an
+     identity chaperone or impersonator when it is a vector (`chaperone-vector`/`-vector*`, `#f`
+     procs, `impersonate-vector` for mutable ones), box, hash table (with and without clear and
+     equal-key procs), `pt` (accessor/mutator subsets, struct-type witness, a chaperoned accessor
+     as orig-proc), exn (`exn-message`), prompt tag (handle/abort procs, `callcc-impersonate-proc`
+     re-wrapping, `comp-guard-proc` 9.2.0.6) or procedure (`chaperone-procedure`/`*`,
+     `impersonate-procedure`/`*`, `#f` wrapper + impersonator property, identity wrappers that also
+     add `'mark` key/val triples, keyword-aware wrappers for keyword procedures); a fifth also
+     wrap the wrapper again. Applications of user functions and primitives at sites go through
+     the wrapper, so loops, known calls and inlined struct accessors / `vector-ref` take the
+     impersonator slow paths (rumble impersonator.ss, struct.ss, vector.ss, procedure.ss, hash,
+     control.ss). Expected (reference/chaperones.scrbl): with identity interposition every
+     operation behaves as on the original; "If wrapper-proc is #f, then applying the resulting
+     impersonator is the same as applying proc"; without a result wrapper "proc is called in tail
+     position with respect to the call to the impersonator"; `equal?` and printing see through.
+     Identity is the one documented difference (a wrapper is not `eq?` to its original), so
+     `eq? eqv? memq memv assq assv` in the program are renamed to `ch:` versions comparing the
+     originals (weak table wrapper -> original) and, in programs with eq?/eqv?-based tables, the
+     key argument of `hash-ref`/`hash-set`/... is unwrapped. Result wrappers (non-tail) only in
+     programs that never mention marks, continuations or prompts; impersonators only in programs
+     without `equal-always?` tables (impersonators are not `equal-always?` to the original).
+     `ch-v` also checks `impersonator-of?`/`chaperone-of?` and the impersonator property
+     (`ch-v: internal error: ...`, kind `internal`). `chapzo` = + zo round trip, `chapsplit` =
+     split + zo round trip of each module. About 1/8 of the draws. `macrodump prog.rkt chap`
+     prints the rewrite. `RKTGEN_VARIANTS=chap,chapzo` (comma list) restricts the draw for probes.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

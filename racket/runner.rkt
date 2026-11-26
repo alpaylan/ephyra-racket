@@ -91,7 +91,8 @@
                    "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"
                    "common" "noclos" "notrap" "dbg" "noinl" "chezmix" "chezmixzo"
                    "future" "futurezo" "futuresplit" "gcfuture" "port" "portsplit"
-                   "top" "topzo" "topsplit" "rtrip" "rtripzo"))
+                   "top" "topzo" "topsplit" "rtrip" "rtripzo"
+                   "chap" "chapzo" "chapsplit"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -525,6 +526,7 @@
                            (and (pair? e) (eq? (car e) 'quote))))
   (define (opq e) (cond [(eq? ctl? 'gc) `(gc-v ,e)]
                         [(eq? ctl? 'rt) `(rt-v ,e)]
+                        [(eq? ctl? 'ch) `(ch-v ,e)]
                         [(eq? ctl? 'pre) `(pre-v ,e)]
                         [(eq? ctl? 'fut) `(fut-v (lambda () ,e))]
                         [(eq? ctl? 'prectl) (if (pick 3) (ctl-wrap e rng) `(pre-v ,e))]
@@ -711,6 +713,179 @@
   (define rng (macro-rng (string-append "rt" src)))
   `(module m ,lang ,@pre ,@rt-defs
      ,@(opaque-rewrite-items items (cdddr form) rng 'rt)))
+
+;; ---------------------------------------------------------------------
+;; Chaperones and impersonators (variants chap, chapzo, chapsplit; steering
+;; round 15).  The opaque sites are wrapped in `(ch-v e)`, which returns e's
+;; value wrapped in an identity chaperone or impersonator when it is a
+;; vector, box, hash table, `pt` or exn struct, procedure (not a parameter),
+;; or prompt tag; sometimes a chaperone of a chaperone.  Interposition
+;; procedures return the values they get, so (reference/chaperones.scrbl)
+;; every operation on the wrapper behaves as on the original: "If
+;; wrapper-proc is #f, then applying the resulting impersonator is the same
+;; as applying proc"; "If result-wrapper-proc is not supplied, then proc is
+;; called in tail position with respect to the call to the impersonator";
+;; equal? and printing look through chaperones.  This sends values down the
+;; impersonator slow paths of rumble (impersonator.ss, struct.ss, vector.ss,
+;; procedure.ss, hash, control.ss for prompt tags) behind schemify's and
+;; cptypes' inline fast paths (struct accessors, vector-ref, known calls).
+;; Identity is the one observable difference (a wrapper is not eq? to its
+;; original), so eq?/eqv?/memq/memv/assq/assv in the program become `ch:`
+;; versions comparing originals (a weak table wrapper -> original), and in
+;; programs with eq?/eqv?-based tables the key argument of hash operations
+;; is unwrapped too.  Result wrappers (non-tail calls) only in programs that
+;; never look at continuations or marks; impersonators (not equal-always? to
+;; their original) only in programs without equal-always? tables.  Checked
+;; invariants: chaperone-of?/impersonator-of? to the original, the
+;; impersonator property reads back (violation: `ch-v: internal error`).
+(define (ch-defs seed res-ok? imp-ok?)
+  `((define ch-seed ,seed)
+    (define ch-n 0)
+    (define ch-orig (make-weak-hasheq))
+    (define-values (ch-prop ch-prop? ch-prop-ref) (make-impersonator-property 'ch-prop))
+    (define ch-key (make-continuation-mark-key 'ch-key))
+    (define (ch-unwrap v) (let loop ([v v]) (let ([o (hash-ref ch-orig v #f)]) (if o (loop o) v))))
+    (define (ch:eq? a b) (eq? (ch-unwrap a) (ch-unwrap b)))
+    (define (ch:eqv? a b) (eqv? (ch-unwrap a) (ch-unwrap b)))
+    (define (ch-mem same? who)
+      (lambda (x l) (if (list? l)
+                        (let loop ([l l]) (cond [(null? l) #f] [(same? x (car l)) l] [else (loop (cdr l))]))
+                        (who x l))))
+    (define ch:memq (ch-mem ch:eq? memq))
+    (define ch:memv (ch-mem ch:eqv? memv))
+    (define (ch-ass same? who)
+      (lambda (x l) (if (and (list? l) (andmap pair? l))
+                        (let loop ([l l]) (cond [(null? l) #f] [(same? x (caar l)) (car l)] [else (loop (cdr l))]))
+                        (who x l))))
+    (define ch:assq (ch-ass ch:eq? assq))
+    (define ch:assv (ch-ass ch:eqv? assv))
+    (define (ch-key1 f) (lambda (h k . r) (apply f h (ch-unwrap k) r)))
+    (define ch:hash-ref (ch-key1 hash-ref))
+    (define ch:hash-set (ch-key1 hash-set))
+    (define ch:hash-set! (ch-key1 hash-set!))
+    (define ch:hash-remove (ch-key1 hash-remove))
+    (define ch:hash-remove! (ch-key1 hash-remove!))
+    (define ch:hash-has-key? (ch-key1 hash-has-key?))
+    (define ch:hash-update (ch-key1 hash-update))
+    (define ch:hash-update! (ch-key1 hash-update!))
+    (define ch:hash-ref! (ch-key1 hash-ref!))
+    (define (ch-fail what v w)
+      (when (getenv "RKT_CH_DEBUG")
+        (eprintf "ch-fail ~a: ~s ~s chaperone?=~a impersonator?=~a n=~a\n" what v w (chaperone? w) (impersonator? w) ch-n))
+      (error 'ch-v "internal error: ~a: ~.s" what v))
+    (define (ch-id . vs) (apply values vs))
+    (define (ch-pick m) (modulo (+ ch-seed (* 7 ch-n) (quotient ch-n 3)) m))
+    (define (ch-proc v k)
+      (define-values (req allowed) (procedure-keywords v))
+      (define kw? (not (null? allowed)))
+      (define plain (case (modulo k 4)
+                      [(0) ch-id]
+                      [(1) (lambda args (apply values 'mark ch-key k args))]
+                      [(2) (if ,res-ok? (lambda args (apply values ch-id args)) ch-id)]
+                      [else (lambda args (apply values 'mark ch-key k 'mark ch-key (add1 k) args))]))
+      (define w (if kw?
+                    (make-keyword-procedure (lambda (kws kvs . args) (apply plain kvs args)) plain)
+                    plain))
+      (define w* (if kw?
+                     (make-keyword-procedure (lambda (kws kvs self . args) (apply plain kvs args))
+                                             (lambda (self . args) (apply plain args)))
+                     (lambda (self . args) (apply plain args))))
+      (case (modulo (quotient k 4) 6)
+        [(0) (chaperone-procedure v #f ch-prop k)]
+        [(1) (chaperone-procedure v w ch-prop k)]
+        [(2) (chaperone-procedure* v w* ch-prop k)]
+        [(3) (if ,imp-ok? (impersonate-procedure v w ch-prop k) (chaperone-procedure v w ch-prop k))]
+        [(4) (if ,imp-ok? (impersonate-procedure* v w* ch-prop k) (chaperone-procedure* v w* ch-prop k))]
+        [else (if ,imp-ok? (impersonate-procedure v #f ch-prop k) (chaperone-procedure v #f ch-prop k))]))
+    (define (ch-wrap1 v k)
+      (define imp? (and ,imp-ok? (odd? (quotient k 2)) (not (immutable? v))))
+      (cond
+        [(vector? v)
+         (case (modulo k 3)
+           [(0) ((if imp? impersonate-vector chaperone-vector) v (lambda (v i x) x) (lambda (v i x) x) ch-prop k)]
+           [(1) ((if imp? impersonate-vector* chaperone-vector*) v (lambda (s v i x) x) (lambda (s v i x) x) ch-prop k)]
+           [else ((if imp? impersonate-vector chaperone-vector) v #f #f ch-prop k)])]
+        [(box? v) ((if imp? impersonate-box chaperone-box) v (lambda (b x) x) (lambda (b x) x) ch-prop k)]
+        [(hash? v)
+         (define imp? (and ,imp-ok? (odd? (quotient k 2)) (not (immutable? v))))
+         (if (even? k)
+             ((if imp? impersonate-hash chaperone-hash) v
+              (lambda (h key) (values key (lambda (h key x) x)))
+              (lambda (h key x) (values key x))
+              (lambda (h key) key)
+              (lambda (h key) key)
+              ch-prop k)
+             ((if imp? impersonate-hash chaperone-hash) v
+              (lambda (h key) (values key (lambda (h key x) x)))
+              (lambda (h key x) (values key x))
+              (lambda (h key) key)
+              (lambda (h key) key)
+              (lambda (h) (void))
+              (lambda (h key) key)
+              ch-prop k))]
+        [(pt? v)
+         (define mk (if (odd? (quotient k 2)) impersonate-struct chaperone-struct))
+         (case (modulo k 6)
+           [(0) (mk v pt-a (lambda (s x) x) ch-prop k)]
+           [(4) (mk v struct:pt pt-a (lambda (s x) x) set-pt-b! #f ch-prop k)]
+           [(5) (mk v (chaperone-procedure pt-b #f ch-prop k) (lambda (s x) x) ch-prop k)]
+           [(1) (mk v pt-b (lambda (s x) x) set-pt-b! (lambda (s x) x) ch-prop k)]
+           [(2) (mk v pt-a (lambda (s x) x) pt-b (lambda (s x) x) set-pt-a! (lambda (s x) x)
+                    set-pt-b! (lambda (s x) x) ch-prop k)]
+           [else (chaperone-struct v struct:pt ch-prop k)])]
+        [(exn? v) (chaperone-struct v exn-message (lambda (s x) x) ch-prop k)]
+        [(continuation-prompt-tag? v)
+         (case (modulo k 3)
+           [(0) (chaperone-prompt-tag v ch-id ch-id ch-prop k)]
+           [(1) ((if imp? impersonate-prompt-tag chaperone-prompt-tag)
+                 v ch-id ch-id values (lambda (p) p) values ch-prop k)]
+           [else (chaperone-prompt-tag v ch-id ch-id values
+                                       (lambda (p) (lambda vs (apply p vs)))
+                                       (if ,res-ok? ch-id values) ch-prop k)])]
+        [(parameter? v) v]
+        [(procedure? v) (ch-proc v k)]
+        [else v]))
+    (define (ch-v v)
+      (set! ch-n (add1 ch-n))
+      (if (> ch-n 20000)
+          v
+          (let* ([k (ch-pick 1000)]
+                 [w1 (ch-wrap1 v k)]
+                 [w (if (and (not (eq? w1 v)) (zero? (modulo k 5))) (ch-wrap1 w1 (quotient k 5)) w1)])
+            (unless (eq? w v)
+              (hash-set! ch-orig w v)
+              (unless (impersonator-of? w v) (ch-fail "not impersonator-of? its original" v w))
+              (unless (ch-prop? w) (ch-fail "impersonator property lost" v w))
+              ;; chaperone-of? holds only through chaperone layers: check each layer
+              (for ([outer (list w1 w)] [inner (list v w1)])
+                (when (and (not (eq? outer inner)) (chaperone? outer) (not (chaperone-of? outer inner)))
+                  (ch-fail "not chaperone-of? its original" inner outer))))
+            w)))))
+
+(define (ch-rename items keys?)
+  (define tab (append '(eq? eqv? memq memv assq assv)
+                      (if keys? '(hash-ref hash-set hash-set! hash-remove hash-remove!
+                                  hash-has-key? hash-update hash-update! hash-ref!)
+                          '())))
+  (let walk ([e items])
+    (cond [(and (symbol? e) (memq e tab)) (string->symbol (format "ch:~a" e))]
+          [(and (pair? e) (eq? (car e) 'quote)) e]
+          [(pair? e) (cons (walk (car e)) (walk (cdr e)))]
+          [else e])))
+
+(define (ch-module form src)
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append "chap" src)))
+  (define (has? rx) (regexp-match? rx src))
+  (define res-ok? (not (has? #rx"mark|continuation|call/cc|call/ec|prompt")))
+  (define imp-ok? (not (has? #rx"alw")))
+  (define keys? (has? #rx"eqv|hasheq|eq\\?"))
+  (define seed (rng 100000))
+  `(module m ,lang ,@pre ,@(ch-defs seed res-ok? imp-ok?)
+     ,@(ch-rename (opaque-rewrite-items items (cdddr form) rng 'ch) keys?)))
+
+(define (chap-variant? v) (member v '("chap" "chapzo" "chapsplit")))
 
 ;; ---------------------------------------------------------------------
 ;; GC stress (variants gc, gczo, gcsplit; steering round 6).  Garbage
@@ -1597,6 +1772,11 @@
                      [("top" "topzo" "topsplit") (run-top variant form src)]
                      [("rtrip") (eval (rt-module form src))]
                      [("rtripzo") (eval (zo-round-trip (compile (rt-module form src))))]
+                     [("chap") (eval (ch-module form src))]
+                     [("chapzo") (eval (zo-round-trip (compile (ch-module form src))))]
+                     [("chapsplit")
+                      (for ([f (split-module (ch-module form src))])
+                        (eval (zo-round-trip (compile f))))]
                      [else (eval form)])
                    (unless (top-variant? variant) (dynamic-require ''m #f))
                    (when (and (equal? variant "port") (getenv "RKT_PORT_DEBUG"))
@@ -1708,6 +1888,8 @@
                 [("port") (list (port-module form src))]
                 [("portsplit") (split-module (port-module form src))]
                 [("rtrip" "rtripzo") (list (rt-module form src))]
+                [("chap" "chapzo") (list (ch-module form src))]
+                [("chapsplit") (split-module (ch-module form src))]
                 [("top" "topzo") (top-body-forms (top-base form src) src)]
                 [("topsplit") (let ([ms (split-module (top-base form src))])
                                 (cons (car ms) (top-body-forms (cadr ms) src)))]

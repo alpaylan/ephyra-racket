@@ -134,7 +134,8 @@ const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big
                             "local", "localpart", "localzo", "preempt", "preemptctl", "preemptsplit",
                             "common", "noclos", "notrap", "dbg", "noinl", "chezmix", "chezmixzo",
                             "future", "futurezo", "futuresplit", "gcfuture", "port", "portsplit",
-                            "top", "topzo", "topsplit", "rtrip", "rtripzo"];
+                            "top", "topzo", "topsplit", "rtrip", "rtripzo",
+                            "chap", "chapzo", "chapsplit"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -189,7 +190,15 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 // steering round 13: write/read, fasl, number->string and
                                 // equal-hash-code round trips checked at the opaque sites
                                 "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip",
-                                "rtripzo", "rtripzo", "rtripzo", "rtripzo", "rtripzo", "rtripzo"];
+                                "rtripzo", "rtripzo", "rtripzo", "rtripzo", "rtripzo", "rtripzo",
+                                // steering round 15: identity chaperones/impersonators at the opaque sites
+                                "chap", "chap", "chap", "chap", "chap", "chap", "chap", "chap", "chap",
+                                "chap", "chap", "chap", "chap", "chap", "chap", "chap", "chap", "chap",
+                                "chap", "chap", "chapzo", "chapzo", "chapzo", "chapzo", "chapzo",
+                                "chapzo", "chapzo", "chapzo", "chapzo", "chapzo", "chapzo", "chapzo",
+                                "chapsplit", "chapsplit", "chapsplit", "chapsplit", "chapsplit",
+                                "chapsplit", "chapsplit", "chapsplit", "chapsplit", "chapsplit",
+                                "chapsplit", "chapsplit"];
 
 /// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
 /// in 9.3: a case using one is not sent to the 9.3 server.
@@ -1187,6 +1196,9 @@ fn main() {
             let pyscript = build.join("harness/numref.py");
             let mut numctx = if pyscript.exists() { Some(NumCtx { py: spawn_py(&pyscript), script: pyscript.clone() }) } else { None };
             let (mut cases, mut failures) = (0u64, 0u64);
+            let only_variants: Option<Vec<&'static str>> = std::env::var("RKTGEN_VARIANTS").ok().map(|l| {
+                l.split(',').filter_map(|x| VARIANTS.iter().copied().find(|v| *v == x)).collect::<Vec<_>>()
+            }).filter(|l| !l.is_empty());
             let mut last_write = Instant::now();
             write_stats(&out, 0, 0, &extra, 0.0);
             let property = |p: Program| -> TestResult {
@@ -1244,6 +1256,10 @@ fn main() {
                     let iter = input.iteration();
                     // one variant per drawn case; unchanged while it is shrunk
                     let mut v = VARIANT_DRAW[(mix(seed, 7_000_000 + cases) % VARIANT_DRAW.len() as u64) as usize];
+                    // probes: RKTGEN_VARIANTS=a,b,c restricts the draw (unset in the search)
+                    if let Some(only) = &only_variants {
+                        v = only[(mix(seed, 7_100_000 + cases) % only.len() as u64) as usize];
+                    }
                     // port variants only change programs with string/bytes ports
                     if v.starts_with("port") && !render_program(&input.value.0).contains("(open-") {
                         v = "opaque";
