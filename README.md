@@ -331,3 +331,9 @@ statically links the kernel). Profiles of build-time runs go to `<build>/build-p
 Scheme-level code (schemify, expander, the Chez compiler passes where most bugs live) is not visible
 to LLVM coverage; trunk has no Scheme-level coverage counters. A 30 s run reached 39% of
 functions / 29% of lines of the instrumented C.
+
+Round 10 check (a trunk build with fixes for the bugs found so far, 4 x 600 s + 4 x 360 s, ~14 000 cases): 300 sampled programs x 7 knob
+variants gave no differences; the search found 6 `*__internal__*` findings (chezmixzo, notrap,
+common), all the same Chez crash: with `$enable-check-prelex-flags` on, `compile-to-port` of
+`(lambda (t) (real->flonum (+ 5 (length t))))` (also `(inexact (if (fixnum? t) (+ t 1) 1))`)
+dies with "invalid memory reference"; it needs cptypes (`enable-type-recovery #f` avoids it).
