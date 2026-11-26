@@ -1440,6 +1440,24 @@
 (define (string-join* l sep)
   (apply string-append (add-between l sep)))
 
+;; The port variants (and kind 10 / file output ports) create temporary files
+;; under (find-system-path 'temp-dir).  With TMPDIR unset or not a directory
+;; Racket falls back to /var/tmp, which may exist but not be writable (a
+;; sandbox): every such case then fails with "open-output-file: error
+;; opening file" in the variant only, a false `port__value__*` failure.
+;; Point TMPDIR at the first writable candidate before any program runs.
+(define (writable-dir? d)
+  (with-handlers ([(lambda (e) #t) (lambda (e) #f)])
+    (define f (build-path d (format "rktpa-probe-~a-~a" (current-inexact-milliseconds) (eq-hash-code (box 0)))))
+    (call-with-output-file f void #:exists 'truncate)
+    (delete-file f)
+    #t))
+(unless (writable-dir? (find-system-path 'temp-dir))
+  (for/first ([d (list (getenv "TMPDIR") "/tmp" "/dev/shm" (path->string (current-directory)))]
+              #:when (and d (not (equal? d "")) (directory-exists? d) (writable-dir? d)))
+    (putenv "TMPDIR" d))
+  (void))
+
 (define args (current-command-line-arguments))
 (cond
   [(and (= (vector-length args) 1) (equal? (vector-ref args 0) "server"))
