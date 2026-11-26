@@ -328,6 +328,32 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      the same with a zo round trip of each module. `macrodump prog.rkt chezmix` prints the rewrite.
      Not used: `compile-profile 'block` (no counters without source objects), `$loop-unroll-limit`
      (np-profile-unroll-loops is "disabled for now" in cpnanopass.ss). About a fifth of the draws.
+   - `future`, `futurezo`, `futuresplit`, `gcfuture` (metamorphic, steering round 11; runner.rkt
+     `future-module`): the opaque sites are evaluated as `(fut-v (lambda () e))`, i.e.
+     `(touch (future thunk))` after spinning 0/300/3000/30000 iterations (per program) until a
+     future worker pthread has started the thunk (an fsemaphore it posts). So `e` runs on another
+     Chez OS thread (own thread context and allocation area, unboxed locals, event checks) until a
+     blocking operation (printing, exceptions, continuation operations) suspends it and the touch
+     resumes it in the case thread (racket/src/thread/future*.rkt, rumble). Sites inside sites nest
+     futures (a touch inside a running future) for half of the programs; the other half call the
+     thunk directly when already inside a future. After 3000 futures per case `fut-v` just calls the
+     thunk. Expected: reference/futures.scrbl, "The touch function forces the evaluation of the
+     thunk inside the given future, returning the values produced by thunk"; blocking operations
+     are suspended and resumed by `touch`, so the output must equal the plain module's (sites are
+     single-valued and non-tail; the thunk body is a fresh frame like the argument position was;
+     only one future runs at a time, no races on program state). `futurezo` = + zo round trip,
+     `futuresplit` = split + zo round trip of each module, `gcfuture` (server `e`, gc knobs and
+     background place as `gc`) adds a noise future started with the module that allocates and
+     checks its own lists until the module's last form stops it (`internal error: the noise
+     future's lists were damaged`), so collections must rendezvous with a running future. For
+     these variants a case thread that ends without a result while its custodian is still alive
+     (no memory-limit kill) is reported as `internal error: the case thread ended without a
+     result` (otherwise it would look like `oom` and be skipped). The repro retries a matching run
+     twice (worker timing). Found in the first probe (also in 9.3): with nested futures, an abort,
+     `call/cc`, `call-with-composable-continuation` or `current-continuation-marks` for a prompt
+     installed inside the outer future's thunk fails ~50% of runs with "no corresponding prompt in
+     the continuation", and an abort to the default tag from the inner future kills the whole
+     Racket thread. About 1/7 of the draws. `macrodump prog.rkt future` prints the rewrite.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

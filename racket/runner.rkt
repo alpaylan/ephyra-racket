@@ -14,7 +14,7 @@
 ;;   timeout <output>
 ;;   oom
 (require racket/port racket/fixnum racket/flonum racket/unsafe/ops racket/list
-         racket/string racket/pretty ffi/unsafe/vm racket/place)
+         racket/string racket/pretty ffi/unsafe/vm racket/place racket/future)
 
 ;; Optimizer variants (third oracle, README.md "Variants"): the same module
 ;; compiled to machine code with one compiler toggle changed.
@@ -82,11 +82,15 @@
 ;;   chezmix  a combination of the above (+ notr, cp0big), chosen from the
 ;;            program text, applied to the module rewritten by opaque, local
 ;;            or split (or unchanged); chezmixzo: same + zo round trip
+;;   future   sites evaluated in futures: (touch (future (lambda () e)))
+;;            after the worker started it (future-module); futurezo: + zo;
+;;            futuresplit: split + zo; gcfuture: gc knobs + a noise future
 (define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
                    "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"
                    "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"
                    "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"
-                   "common" "noclos" "notrap" "dbg" "noinl" "chezmix" "chezmixzo"))
+                   "common" "noclos" "notrap" "dbg" "noinl" "chezmix" "chezmixzo"
+                   "future" "futurezo" "futuresplit" "gcfuture"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -520,6 +524,7 @@
                            (and (pair? e) (eq? (car e) 'quote))))
   (define (opq e) (cond [(eq? ctl? 'gc) `(gc-v ,e)]
                         [(eq? ctl? 'pre) `(pre-v ,e)]
+                        [(eq? ctl? 'fut) `(fut-v (lambda () ,e))]
                         [(eq? ctl? 'prectl) (if (pick 3) (ctl-wrap e rng) `(pre-v ,e))]
                         [ctl? (ctl-wrap e rng)]
                         [else `(opq-v ,e)]))
@@ -727,7 +732,7 @@
 (define chez-check-heap (vm-eval '($primitive $enable-check-heap)))
 (define chez-heap-errors (vm-eval '($primitive $check-heap-errors)))
 
-(define (gc-variant? v) (member v '("gc" "gczo" "gcsplit")))
+(define (gc-variant? v) (member v '("gc" "gczo" "gcsplit" "gcfuture")))
 
 ;; returns (values restore-thunk check-heap?)
 (define (set-gc-knobs! src)
@@ -847,6 +852,83 @@
                (set-box! fail "helper's ring vector changed across a swap")))
            (set! pre-swaps (add1 pre-swaps))
            (unless (unbox fail) (loop (add1 i) (fl+ acc 0.25)))))))))
+
+;; ---------------------------------------------------------------------
+;; Futures (variants future, futurezo, futuresplit, gcfuture; steering
+;; round 11).  The opaque sites are evaluated as `(fut-v (lambda () e))`:
+;; the thunk becomes a future (racket/future), the runner spins a little
+;; (K iterations, K per program) until a future worker pthread has started
+;; it, then touches it.  So `e` runs on another Chez OS thread (its own
+;; thread context, allocation area, unboxed flonum locals, event checks),
+;; until it reaches a blocking operation (printing, exceptions, continuation
+;; operations, parameterize...), which suspends the future until the touch
+;; resumes it in the case thread (thread/future*.rkt, rumble future and
+;; engine blocking, collections requested while futures run).  Futures nest
+;; when a site is inside another site.  Expected: reference/futures.scrbl,
+;; "The touch function forces the evaluation of the thunk inside the given
+;; future, returning the values produced by thunk"; the future runs "in
+;; parallel ... until it detects an attempt to perform an operation that
+;; cannot run safely in parallel" and blocking operations are resumed by
+;; touch, so `(touch (future (lambda () e)))` must produce what `e` does
+;; (sites are single-valued, non-tail; the thunk body is a fresh frame, as
+;; the argument position was).  Only one future runs at a time besides the
+;; gcfuture noise future, so there are no races on the program's state.
+;; After 3000 futures in one case the wrapper just calls the thunk (time).
+;; `gcfuture` (server e): the gc knobs (small collect-trip-bytes, in-place
+;; marking, object counts, background place) plus a noise future started
+;; with the module that allocates and checks its own lists while the case
+;; runs, so collections must rendezvous with running futures.
+(define (future-defs src noise?)
+  (define rng (macro-rng (string-append "futK" src)))
+  `((require (only-in racket/future future touch current-future make-fsemaphore fsemaphore-post
+                      fsemaphore-try-wait?))
+    (define fut-n 0)
+    (define (fut-v th)
+      (set! fut-n (add1 fut-n))
+      ;; half of the programs never nest futures (a future touched inside
+      ;; a running future: see README for the known nested-prompt failure)
+      (if (or (> fut-n 3000) ,(if (zero? (rng 2)) '(current-future) #f))
+          (th)
+          (let* ([s (make-fsemaphore 0)]
+                 [f (future (lambda () (fsemaphore-post s) (th)))])
+            (let loop ([i 0])
+              (unless (or (fsemaphore-try-wait? s) (= i ,(vector-ref #(0 300 3000 30000) (rng 4))))
+                (loop (add1 i))))
+            (touch f))))
+    ,@(if noise?
+          '((define fut-stop (box #f))
+            (define fut-bad (box #f))
+            (define fut-noise
+              (future
+               (lambda ()
+                 (let loop ([i 0] [keep '()])
+                   (unless (or (unbox fut-stop) (> i 2000000))
+                     (let ([l (list i (exact->inexact i) (vector i i) (* i i i i i))])
+                       (when (and (pair? keep)
+                                  (let ([o (car keep)])
+                                    (not (and (eqv? (cadr o) (exact->inexact (car o)))
+                                              (equal? (caddr o) (vector (car o) (car o)))
+                                              (eqv? (cadddr o) (* (car o) (car o) (car o) (car o) (car o)))))))
+                         (set-box! fut-bad #t))
+                       (loop (add1 i) (if (< (length keep) 50) (cons l keep) (list l))))))))))
+          '())))
+
+;; the end of a gcfuture module: stop the noise future, report damage
+(define future-tail
+  '((set-box! fut-stop #t)
+    (touch fut-noise)
+    (when (unbox fut-bad)
+      (error 'fut "internal error: the noise future's lists were damaged"))))
+
+(define (future-variant? v) (member v '("future" "futurezo" "futuresplit" "gcfuture")))
+
+(define (future-module form src [noise? #f])
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append "future" src)))
+  `(module m ,lang ,@pre ,@(future-defs src noise?)
+     ,@(opaque-rewrite-items items (cdddr form) rng 'fut)
+     ,@(if noise? future-tail '())))
 
 ;; ---------------------------------------------------------------------
 ;; Metamorphic "local" rewrite (variants local, localpart; steering round 8).
@@ -1079,7 +1161,7 @@
 
 (define (fresh-ns)
   (define ns (make-base-namespace))
-  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list ffi/unsafe/vm)])
+  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list ffi/unsafe/vm racket/future)])
     (namespace-attach-module orig-ns m ns))
   ns)
 
@@ -1173,6 +1255,12 @@
                       (if (zero? ((macro-rng (string-append "knobzo" src)) 2))
                           (eval (zo-round-trip (compile form)))
                           (eval form))]
+                     [("future") (eval (future-module form src))]
+                     [("futurezo") (eval (zo-round-trip (compile (future-module form src))))]
+                     [("futuresplit")
+                      (for ([f (split-module (future-module form src))])
+                        (eval (zo-round-trip (compile f))))]
+                     [("gcfuture") (eval (future-module form src #t))]
                      [("chezmix") (for ([f (chezmix-forms form src)]) (eval f))]
                      [("chezmixzo")
                       (for ([f (chezmix-forms form src)]) (eval (zo-round-trip (compile f))))]
@@ -1182,6 +1270,7 @@
                      (dynamic-require '(submod 'm sub) #f))
                    (list "ok" (get-output-string out)))))))))
   (define done (sync/timeout TIMEOUT th))
+  (define cust-down? (custodian-shut-down? cust))
   (custodian-shutdown-all cust)
   (restore!)
   (gc-restore!)
@@ -1201,6 +1290,12 @@
      (list "exn" (get-output-string out) "heap-check"
            (format "internal error: ~a Chez heap check errors after the case" heap-errs))]
     [(not done) (list "timeout" (get-output-string out))]
+    ;; future variants: the case thread ended without a result although its
+    ;; custodian was not shut down (no memory-limit kill): something (an
+    ;; abort escaping its prompt) terminated the thread itself
+    [(and (not result) (future-variant? variant) (not cust-down?))
+     (list "exn" (get-output-string out) "thread-died"
+           "internal error: the case thread ended without a result")]
     [(not result) (list "oom")]
     [else result]))
 
@@ -1254,6 +1349,9 @@
                 [("preemptctl") (list (preempt-module form src #t))]
                 [("preemptsplit") (split-module (preempt-module form src))]
                 [("chezmix" "chezmixzo") (chezmix-forms form src)]
+                [("future" "futurezo") (list (future-module form src))]
+                [("futuresplit") (split-module (future-module form src))]
+                [("gcfuture") (list (future-module form src #t))]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])

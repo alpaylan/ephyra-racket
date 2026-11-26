@@ -131,7 +131,8 @@ const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big
                             "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub",
                             "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit", "ref93",
                             "local", "localpart", "localzo", "preempt", "preemptctl", "preemptsplit",
-                            "common", "noclos", "notrap", "dbg", "noinl", "chezmix", "chezmixzo"];
+                            "common", "noclos", "notrap", "dbg", "noinl", "chezmix", "chezmixzo",
+                            "future", "futurezo", "futuresplit", "gcfuture"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -165,7 +166,13 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "dbg", "dbg", "noinl", "noinl", "noinl", "noinl",
                                 "chezmix", "chezmix", "chezmix", "chezmix", "chezmix", "chezmix",
                                 "chezmix", "chezmix", "chezmixzo", "chezmixzo", "chezmixzo", "chezmixzo",
-                                "chezmixzo", "chezmixzo", "chezmixzo", "chezmixzo"];
+                                "chezmixzo", "chezmixzo", "chezmixzo", "chezmixzo",
+                                // steering round 11: sites evaluated in futures (other OS threads)
+                                "future", "future", "future", "future", "future", "future", "future",
+                                "future", "future", "future", "futurezo", "futurezo", "futurezo",
+                                "futurezo", "futurezo", "futurezo", "futuresplit", "futuresplit",
+                                "futuresplit", "futuresplit", "futuresplit", "futuresplit", "futuresplit",
+                                "futuresplit", "gcfuture", "gcfuture", "gcfuture"];
 
 /// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
 /// in 9.3: a case using one is not sent to the 9.3 server.
@@ -685,10 +692,11 @@ else
   c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
 fi
 rc=$(res "$c")
-# preempt*: where the timer fires during compilation depends on timing, so
+# preempt*/future*: where the timer fires during compilation (or whether a
+# future worker picks a future up before the touch) depends on timing, so
 # a run that matches is retried twice (the program's own sites are
 # deterministic in ticks, the expander/compiler's swaps are not)
-case "$VAR" in preempt*)
+case "$VAR" in preempt*|future*|gcfuture)
   for t in 1 2; do
     [ "$KIND" != died ] && [ "$KIND" != hang ] && [ -n "$rc" ] && [ "$ra" = "$rc" ] || break
     c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
