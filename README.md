@@ -49,7 +49,8 @@ git clone https://github.com/racket/racket
 cat out/stats.json; ls out/findings
 ```
 
-`build.sh <racket-tree> <build-dir> [coverage]` copies the tree to `<build-dir>/src` (the Racket build
+`build.sh <racket-tree> <build-dir> [coverage]` takes a fresh clone of racket/racket (not a tree
+already built in place: its `racket/src/ChezScheme/boot/pb` checkout breaks the copy) and copies it to `<build-dir>/src` (the Racket build
 writes inside its tree; rsync keeps mtimes, so rebuilds are incremental), runs
 `make base PKGS=racket-lib` there (`CPUS`/`JOBS`, default 16), builds the generator with cargo, and
 compiles `racket/runner.rkt` to a `.zo`. With `coverage` it builds the C parts with clang source-based
