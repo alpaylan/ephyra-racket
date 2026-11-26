@@ -259,6 +259,23 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      count (≈ swaps) to stderr. The repro retries a matching variant run twice (swaps during
      compilation depend on timing). About a fifth of the drawn cases; `macrodump prog.rkt preempt`
      prints the rewrite.
+   - `common`, `noclos`, `notrap`, `dbg`, `noinl`, `chezmix`, `chezmixzo` (option toggles, steering
+     round 10; runner.rkt `set-chez-knobs!`): Chez compiler parameters Racket never changes, so
+     their code paths in the Chez compiler were never exercised. `common`: `commonization-level`
+     1-9 (cpcommonize, merging similar lambdas; CSUG: commonization "should not affect the
+     behavior of the program"); `noclos`: internal `$optimize-closures #f` + `$lift-closures #f`
+     (np-expand-closures instead of np-expand/optimize-closures, no well-known closure lifting);
+     `notrap`: `generate-interrupt-trap #f` (no event-check/trap code in user code; loops are
+     bounded); `dbg`: `debug-level 3` + `generate-inspector-information #t`; `noinl`: internal
+     `$suppress-primitive-inlining #t` (every primitive called out of line instead of the cpprim
+     inline code); half of the programs of each go through `compile` + zo round trip (compile-to-port). All of them also turn on `$enable-check-prelex-flags` (the Chez mats run with it, mats/build.zuo `ecpf`; only effective on the compile-to-port path), Chez's own consistency
+     check of prelex referenced/assigned flags after each front-end pass (a violation raises
+     `Exception in cpcheck-prelex-flags ...`, kind `internal`/`error`). `chezmix` applies a
+     combination of the knobs (plus notr / cp0big), chosen from the program text, to the module
+     unchanged, opaque-rewritten, localpart-rewritten, split, or ctlnoise+split; `chezmixzo` does
+     the same with a zo round trip of each module. `macrodump prog.rkt chezmix` prints the rewrite.
+     Not used: `compile-profile 'block` (no counters without source objects), `$loop-unroll-limit`
+     (np-profile-unroll-loops is "disabled for now" in cpnanopass.ss). About a fifth of the draws.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

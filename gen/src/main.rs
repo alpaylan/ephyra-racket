@@ -130,7 +130,8 @@ struct Pair {
 const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big", "zo", "machind", "jitify",
                             "split", "splitzo", "splitmi", "macro", "macrozo", "macrosplit", "macrosub",
                             "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit", "ref93",
-                            "local", "localpart", "localzo", "preempt", "preemptctl", "preemptsplit"];
+                            "local", "localpart", "localzo", "preempt", "preemptctl", "preemptsplit",
+                            "common", "noclos", "notrap", "dbg", "noinl", "chezmix", "chezmixzo"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -157,7 +158,14 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "preemptctl", "preemptctl", "preemptctl", "preemptctl", "preemptctl",
                                 "preemptctl", "preemptctl", "preemptctl",
                                 "preemptsplit", "preemptsplit", "preemptsplit", "preemptsplit",
-                                "preemptsplit", "preemptsplit", "preemptsplit", "preemptsplit"];
+                                "preemptsplit", "preemptsplit", "preemptsplit", "preemptsplit",
+                                // steering round 10: Chez compiler knobs Racket never sets
+                                "common", "common", "common", "common", "common", "noclos", "noclos",
+                                "noclos", "noclos", "noclos", "notrap", "notrap", "notrap", "dbg", "dbg",
+                                "dbg", "dbg", "noinl", "noinl", "noinl", "noinl",
+                                "chezmix", "chezmix", "chezmix", "chezmix", "chezmix", "chezmix",
+                                "chezmix", "chezmix", "chezmixzo", "chezmixzo", "chezmixzo", "chezmixzo",
+                                "chezmixzo", "chezmixzo", "chezmixzo", "chezmixzo"];
 
 /// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
 /// in 9.3: a case using one is not sent to the 9.3 server.

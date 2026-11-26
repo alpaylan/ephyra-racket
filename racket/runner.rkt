@@ -68,10 +68,25 @@
 ;;            (to a helper thread) at a later event check
 ;;   preemptctl  preempt, some sites wrapped in the ctlnoise forms instead
 ;;   preemptsplit  preempt, then split, each module through a zo round trip
+;;   Chez compiler knobs Racket never sets (steering round 10); every one of
+;;   them also turns on $enable-check-prelex-flags (Chez's own check that
+;;   prelex referenced/assigned flags are consistent after each front pass;
+;;   only run on the compile-to-port path, so half of the programs of each
+;;   single-knob variant go through a zo round trip; the Chez mats run
+;;   with it, mats/build.zuo `ecpf`, like `spi` and `cl`):
+;;   common   commonization-level 1..9 (cpcommonize pass)
+;;   noclos   $optimize-closures #f, $lift-closures #f (np-expand-closures)
+;;   notrap   generate-interrupt-trap #f (no event-check code in user code)
+;;   dbg      debug-level 3, generate-inspector-information #t
+;;   noinl    $suppress-primitive-inlining #t (library calls, no cpprim code)
+;;   chezmix  a combination of the above (+ notr, cp0big), chosen from the
+;;            program text, applied to the module rewritten by opaque, local
+;;            or split (or unchanged); chezmixzo: same + zo round trip
 (define VARIANTS '("none" "unsafe" "nocp0" "notr" "ctx" "noconst" "cp0big" "zo" "machind"
                    "split" "splitzo" "splitmi" "macro" "macrozo" "macrosplit" "macrosub"
                    "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"
-                   "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"))
+                   "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"
+                   "common" "noclos" "notrap" "dbg" "noinl" "chezmix" "chezmixzo"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -747,6 +762,16 @@
 (define chez-score (vm-eval 'cp0-score-limit))
 (define chez-effort (vm-eval 'cp0-effort-limit))
 (define chez-unroll (vm-eval 'cp0-outer-unroll-limit))
+(define chez-common (vm-eval 'commonization-level))
+(define chez-optclos (vm-eval '($primitive $optimize-closures)))
+(define chez-liftclos (vm-eval '($primitive $lift-closures)))
+(define chez-trap (vm-eval 'generate-interrupt-trap))
+(define chez-debug-level (vm-eval 'debug-level))
+(define chez-inspinfo (vm-eval 'generate-inspector-information))
+(define chez-noinline (vm-eval '($primitive $suppress-primitive-inlining)))
+(define chez-check-prelex (vm-eval '($primitive $enable-check-prelex-flags)))
+(define chez-knobs2 (list chez-common chez-optclos chez-liftclos chez-trap chez-debug-level
+                          chez-inspinfo chez-noinline chez-check-prelex))
 
 ;; ---------------------------------------------------------------------
 ;; Preemption (variants preempt, preemptctl, preemptsplit; steering round 9).
@@ -873,19 +898,55 @@
 
 ;; Sets Chez-level knobs (per OS thread, so they apply to the case thread
 ;; too); returns a thunk that restores them.
-(define (set-chez-knobs! variant)
+(define (set-chez-knobs! variant [src ""])
   (define cp0 (chez-run-cp0))
   (define tr (chez-type-recovery))
   (define sc (chez-score))
   (define ef (chez-effort))
   (define un (chez-unroll))
+  (define saved (for/list ([k (in-list chez-knobs2)]) (k)))
+  (define (noclos!) (chez-optclos #f) (chez-liftclos #f))
+  (define (dbg!) (chez-debug-level 3) (chez-inspinfo #t))
+  (define (knob2!) (chez-check-prelex #t))
   (case variant
     [("nocp0") (chez-run-cp0 (lambda (cp0 x) x))]
     [("notr") (chez-type-recovery #f)]
     [("cp0big") (chez-score 120) (chez-effort 5000) (chez-unroll 2)]
+    [("common") (knob2!) (chez-common (add1 (modulo (string-length src) 9)))]
+    [("noclos") (knob2!) (noclos!)]
+    [("notrap") (knob2!) (chez-trap #f)]
+    [("dbg") (knob2!) (dbg!)]
+    [("noinl") (knob2!) (chez-noinline #t)]
+    [("chezmix" "chezmixzo")
+     (knob2!)
+     (define rng (macro-rng (string-append "chezmix" src)))
+     ;; at least one knob: draw until something was set
+     (let loop ([n 0])
+       (define any? #f)
+       (define-syntax-rule (maybe k e ...) (when (< (rng 100) k) (set! any? #t) e ...))
+       (maybe 40 (chez-common (add1 (rng 9))))
+       (maybe 35 (noclos!))
+       (maybe 25 (chez-trap #f))
+       (maybe 30 (dbg!))
+       (maybe 20 (chez-noinline #t))
+       (maybe 20 (chez-type-recovery #f))
+       (maybe 20 (chez-score 120) (chez-effort 5000) (chez-unroll 2))
+       (unless (or any? (> n 5)) (loop (add1 n))))]
     [else (void)])
   (lambda ()
+    (for ([k (in-list chez-knobs2)] [v (in-list saved)]) (k v))
     (chez-run-cp0 cp0) (chez-type-recovery tr) (chez-score sc) (chez-effort ef) (chez-unroll un)))
+
+(define (chezmix-variant? v) (member v '("chezmix" "chezmixzo")))
+;; the rewrite chezmix applies (deterministic in the text)
+(define (chezmix-forms form src)
+  (define rng (macro-rng (string-append "chezmixrw" src)))
+  (case (rng 5)
+    [(0) (list form)]
+    [(1) (list (opaque-module form src))]
+    [(2) (list (local-module form src #t))]
+    [(3) (split-module form)]
+    [else (split-module (opaque-module form src #t))]))
 
 (define TIMEOUT (let ([s (getenv "RKT_CASE_TIMEOUT")]) (if s (string->number s) 10)))
 (define MAX-OUT 20000)
@@ -912,7 +973,7 @@
   (define cust (make-custodian))
   (custodian-limit-memory cust (* 2048 1024 1024) cust)
   (define result #f)
-  (define restore! (set-chez-knobs! variant))
+  (define restore! (set-chez-knobs! variant src0))
   (define-values (gc-restore! check-heap?)
     (if (gc-variant? variant) (set-gc-knobs! src) (values void #f)))
   (define pre-fail (and (preempt-variant? variant) (box #f)))
@@ -988,6 +1049,15 @@
                      [("preemptsplit")
                       (for ([f (split-module (preempt-module form src))])
                         (eval (zo-round-trip (compile f))))]
+                     [("common" "noclos" "notrap" "dbg" "noinl")
+                      ;; half of the programs through compile-to-port (the
+                      ;; file-compile path, where Chez runs its prelex check)
+                      (if (zero? ((macro-rng (string-append "knobzo" src)) 2))
+                          (eval (zo-round-trip (compile form)))
+                          (eval form))]
+                     [("chezmix") (for ([f (chezmix-forms form src)]) (eval f))]
+                     [("chezmixzo")
+                      (for ([f (chezmix-forms form src)]) (eval (zo-round-trip (compile f))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
                    (when (equal? variant "macrosub")
@@ -1065,6 +1135,7 @@
                 [("preempt") (list (preempt-module form src))]
                 [("preemptctl") (list (preempt-module form src #t))]
                 [("preemptsplit") (split-module (preempt-module form src))]
+                [("chezmix" "chezmixzo") (chezmix-forms form src)]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])
