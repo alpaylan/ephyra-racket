@@ -552,6 +552,51 @@ modes against the given build and exits 1/0/2.
    `numref_py_lost`, `fail_numref_*`. Before round 14, 2400 programs (~60 000 expressions) passed
    on trunk+patches.
 
+5. **rxref** (`rxref__{value,error,died}__<mode>-<area>`, steering round 16): a second reference for
+   the regexp matcher (racket/src/regexp, shared by every mode, so no Racket-vs-Racket oracle sees
+   it). An eighth of the cases (`mix(seed, 9_300_000 + case) % 8 == 0`, outside ephyra) are
+   programs from `racket/rxref.py gen`: 3-5 lines, each a generated pregexp (literals incl.
+   non-ASCII / astral chars and high bytes, `.`, classes with ranges / `\d\w\s` / POSIX classes,
+   negated classes, `\D\W\S`, `\p{..}`/`\P{..}` in string mode, `^ $ \b \B`, greedy / lazy /
+   bounded quantifiers (only on operands that cannot match empty: rx.rkt rejects others; no
+   unbounded repeat under another one), alternation, groups, `(?i:` `(?-i:` `(?m:` `(?s:` ...
+   modes, lookahead, fixed-width lookbehind, atomic groups, back references, `(?(N)..|..)`) on
+   a byte string (`byte-pregexp`) or a string (`pregexp`), with an input built partly from strings
+   the pattern matches, an optional start / end position and input prefix. Each line runs
+   `regexp-match-positions`, the same on an input port, `regexp-match-peek-positions`,
+   `regexp-match`, `regexp-match` on a port (bytes results), `regexp-match-positions*` on the
+   value and on a port, `regexp-split`, `regexp-replace*` / `regexp-replace` with a template of
+   literals, `&` and `\N`, `regexp-match?`, `regexp-quote` of the input matching itself, and
+   (string mode) the string regexp on the UTF-8 bytes. rxref.py translates the AST into a
+   Python `re` pattern that spells out Racket's documented semantics (rx.rkt grammar:
+   `\w`/`\d`/`\s`/POSIX classes are ASCII, `.` matches newline outside multi mode, `$` is the
+   end, `(?m:` = `(?-s:` multi mode; `\p{..}` becomes the class of pool characters in that
+   category, inputs only use the pool) and computes the expected value of every call from the
+   documented rules in regexps.scrbl: `^` and lookbehind see `input-prefix`, not the input before
+   `start-pos`; positions independent of `start-pos`; port positions count bytes; in
+   `regexp-match*` "each match attempt starts at the end of the last match", `^` only for the
+   first match, no empty match immediately after an empty match; `regexp-split` /
+   `regexp-replace*`: "Zero-length matches are treated the same as for regexp-match*"; an
+   unmatched `\N` in a template is empty. Lines where Racket rejects the pattern are skipped.
+   Area: `str-`/`bytes-` plus the first failing call when `regexp-match-positions` itself is
+   right (e.g. `str-all`, `bytes-repl`), else the most specific construct of the shrunk pattern
+   (`lookbehind`, `cond`, `bref`, `casei`, ...). On a failure rxref.py proposes one-line
+   simplifications (single call, no start/prefix, subtree replaced by a child or `a`, input
+   characters dropped), kept while kind and area stay the same (<= 200 runs). Once a signature
+   has its 3 cases, later hits are only counted (`rxref_dup`), not shrunk or counted as failures.
+   Repro: `repro.sh` runs `runner.rkt file prog.rkt none` and pipes the result into
+   `python3 -I rxref.py check prog.rkt` (each line's spec is the JSON in its `;; RX` comment);
+   `python3 -I rxref.py eval prog.rkt` prints the expected values, `rktgen rxsample <build>
+   <seed>` a program. Stats: `rxref_cases`, `rxref_pass`, `rxref_skip`, `rxref_dup`,
+   `rxref_gen_errors` (should stay 0), `rxref_py_lost`, `fail_rxref_*`. `RKTGEN_NO_RXREF=1`
+   turns it off.
+   Probe on trunk before the merge (120 programs, ~2000 calls): two classes, both also in 9.3:
+   `(regexp-match-positions* #px"(?=.)|(?<=é)" "éé")` gives `((0 . 0) (1 . 1))` without
+   `(2 . 2)` (after an empty match the next attempt loses the multi-byte lookbehind; also `\B`),
+   and `regexp-replace*` handles an empty match differently from `regexp-match*`
+   (`(regexp-match-positions* #px"a??" "ab")` = `((0 . 0) (0 . 1) (1 . 1) (2 . 2))`, but
+   `(regexp-replace* #px"a??" "ab" "[&]")` = `"[]a[]b[]"`).
+
 ## Masked differences (each counted in stats.json)
 
 - `masked_nonfx_msg`: the message of `exn:fail:contract:non-fixnum-result` differs by mode:

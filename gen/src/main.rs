@@ -1128,7 +1128,177 @@ fn numref_case(pair: &mut Pair, nc: &mut NumCtx, rseed: u64, search: &mut Search
     }
 }
 
+// ---------------------------------------------------------------- rxref
+// Oracle `rxref` (steering round 16): generated pregexps matched through
+// many Racket entry points, checked against racket/rxref.py (Python `re`
+// on a translated pattern).  rxref.py generates, checks and proposes
+// shrink candidates; server `a` (machine code) runs the programs.
+
+impl PyRef {
+    fn rx_req(&mut self, script: &Path, msg: &str, multi: bool) -> Option<Vec<String>> {
+        let ok = self.stdin.write_all(msg.as_bytes()).and_then(|_| self.stdin.flush()).is_ok();
+        let mut out = Vec::new();
+        let fail = loop {
+            if !ok { break true; }
+            match self.rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(l) => {
+                    if !multi { out.push(l); break false; }
+                    if l == "END" { break false; }
+                    out.push(l);
+                }
+                Err(_) => break true,
+            }
+        };
+        if fail {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            *self = spawn_py(script);
+            return None;
+        }
+        Some(out)
+    }
+}
+
+struct RxCtx { py: PyRef, script: PathBuf }
+
+impl RxCtx {
+    fn gen(&mut self, seed: u64) -> Option<String> {
+        let s = self.script.clone();
+        self.py.rx_req(&s, &format!("G {seed}\n"), false).and_then(|v| v.into_iter().next()).map(|l| l.replace('\t', "\n"))
+    }
+    fn check(&mut self, prog: &str, line: &str) -> Option<Vec<String>> {
+        let s = self.script.clone();
+        let msg = format!("C {}\n{}{}\n{}", prog.len(), prog, line.len(), line);
+        self.py.rx_req(&s, &msg, false).and_then(|v| v.into_iter().next()).map(|l| l.split('\t').map(|x| x.to_string()).collect())
+    }
+    fn shrink(&mut self, prog: &str, idx: &str) -> Vec<String> {
+        let s = self.script.clone();
+        let msg = format!("S {idx} {}\n{}", prog.len(), prog);
+        self.py.rx_req(&s, &msg, true).unwrap_or_default().into_iter().map(|l| l.replace('\t', "\n")).collect()
+    }
+}
+
+const REPRO_RXREF: &str = r#"#!/usr/bin/env bash
+# Repro for signature @SIG@ (oracle rxref).
+# Runs prog.rkt (regexp lines; each line's spec is the JSON in its ";; RX" comment)
+# through runner.rkt with the build's racket (machine code) and checks every
+# printed "<line>.<op> <value>" against rxref.py, which evaluates the same
+# pattern with Python's re (translated: explicit ASCII classes and anchors).
+# `python3 -I rxref.py eval prog.rkt` prints the expected lines.
+# exit 1: failure reproduces; 0: it does not; 2: cannot decide.
+B=$(cd "$1" 2>/dev/null && pwd) || exit 2
+R="$B/src/racket/bin/racket"
+[ -x "$R" ] || exit 2
+command -v python3 >/dev/null || exit 2
+cd "$(dirname "$0")"
+a=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=20 timeout -k 5 120 "$R" runner.rkt file prog.rkt none 2>&1)
+ra=$(printf '%s\n' "$a" | grep -E $'^(ok|exn|raise|timeout|oom)\t|^oom$' | tail -1)
+[ -z "$ra" ] && exit 2
+v=$(printf '%s\n' "$ra" | python3 -I rxref.py check prog.rkt)
+case "$v" in
+  "fail @KIND@ "*" @AREA@ "*) exit 1;;
+  fail*|pass*) exit 0;;
+esac
+exit 2
+"#;
+
+fn rx_run(pair: &mut Pair, text: &str) -> Res {
+    let lim = Duration::from_secs(CASE_TIMEOUT_S + 30);
+    let ok = Res::Line("ok".into());
+    let s = Pair::send(&mut pair.a, text);
+    let r = Pair::recv(&mut pair.a, s, lim);
+    pair.restart_ab(&r, &ok);
+    r
+}
+
+/// one rxref case; true when a new failure was recorded
+fn rxref_case(pair: &mut Pair, rc: &mut RxCtx, rseed: u64, search: &mut Search, extra: &mut BTreeMap<String, u64>) -> bool {
+    let Some(text) = rc.gen(rseed) else { *extra.entry("rxref_py_lost".into()).or_insert(0) += 1; return false };
+    *extra.entry("rxref_cases".into()).or_insert(0) += 1;
+    let ra = rx_run(pair, &text);
+    let v = match &ra { Res::Line(l) => rc.check(&text, l), _ => None };
+    match (&ra, &v) {
+        (Res::Died(_), _) => {
+            let rb = rx_run(pair, &text);
+            if matches!(rb, Res::Died(_)) {
+                search.record_rx(&text, "died", "program", &res_text(&rb), rseed);
+                return true;
+            }
+            *extra.entry("rxref_died_flaky".into()).or_insert(0) += 1;
+            false
+        }
+        (Res::Hung, _) => { *extra.entry("rxref_hung".into()).or_insert(0) += 1; false }
+        (_, None) => { *extra.entry("rxref_py_lost".into()).or_insert(0) += 1; false }
+        (Res::Line(_), Some(f)) => match f[0].as_str() {
+            "pass" => { *extra.entry("rxref_pass".into()).or_insert(0) += 1; false }
+            "skip" => { *extra.entry("rxref_skip".into()).or_insert(0) += 1; false }
+            "gen" => {
+                *extra.entry("rxref_gen_errors".into()).or_insert(0) += 1;
+                if std::env::var("RKTGEN_RX_DEBUG").is_ok() { eprintln!("rxref gen: {:?}\n{text}", f); }
+                false
+            }
+            "fail" if f.len() >= 5 => {
+                let kind = f[1].clone();
+                let area = f[3].clone();
+                let sig = format!("rxref__{kind}__{area}");
+                *extra.entry(format!("fail_rxref_{kind}")).or_insert(0) += 1;
+                if search.per_sig.get(&sig).copied().unwrap_or(0) >= 3 {
+                    // a signature already recorded 3 times: counted, not re-shrunk
+                    *extra.entry("rxref_dup".into()).or_insert(0) += 1;
+                    return false;
+                }
+                let still = |v: &Option<Vec<String>>| matches!(v, Some(g) if g.len() >= 5 && g[0] == "fail" && g[1] == kind && g[3] == area);
+                let (mut best, mut best_r, mut best_v) = (text.clone(), ra.clone(), v.clone());
+                let mut idx = f[2].clone();
+                let mut steps = 0;
+                'outer: while steps < 200 {
+                    let cands = rc.shrink(&best, &idx);
+                    for c in cands {
+                        if c.len() >= best.len() { continue; }
+                        steps += 1;
+                        if steps >= 200 { break 'outer; }
+                        let r = rx_run(pair, &c);
+                        let vc = match &r { Res::Line(l) => rc.check(&c, l), _ => None };
+                        if still(&vc) {
+                            best = c; best_r = r; best_v = vc; idx = "0".into();
+                            continue 'outer;
+                        }
+                    }
+                    break;
+                }
+                let bv = best_v.unwrap();
+                let msg = format!("{}\nmachine-code: {}", bv.get(4).cloned().unwrap_or_default(), res_text(&best_r));
+                search.record_rx(&best, &kind, &area, &msg, rseed);
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
 impl Search {
+    fn record_rx(&mut self, prog: &str, kind: &str, area: &str, msg: &str, seed: u64) {
+        let sig = format!("rxref__{kind}__{area}");
+        let cnt = self.per_sig.entry(sig.clone()).or_insert(0);
+        if *cnt >= 3 { return; }
+        *cnt += 1;
+        let dir = self.out.join("findings").join(&sig).join(cnt.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("prog.rkt"), prog).unwrap();
+        std::fs::copy(&self.runner_src, dir.join("runner.rkt")).unwrap();
+        std::fs::copy(self.runner_src.with_file_name("rxref.py"), dir.join("rxref.py")).unwrap();
+        std::fs::write(dir.join("results.txt"), msg).unwrap();
+        let fj = format!("{{\"signature\": {}, \"oracle\": \"rxref\", \"message\": {}, \"seed\": {}}}\n",
+                         json_str(&sig), json_str(&msg.chars().take(3000).collect::<String>()), json_str(&format!("{seed}")));
+        std::fs::write(dir.join("finding.json"), fj).unwrap();
+        let rp = dir.join("repro.sh");
+        let body = if kind == "died" {
+            REPRO_RXREF.replace("[ -z \"$ra\" ] && exit 2", "[ -z \"$ra\" ] && exit 1")
+        } else { REPRO_RXREF.to_string() };
+        std::fs::write(&rp, body.replace("@SIG@", &sig).replace("@KIND@", kind).replace("@AREA@", area)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&rp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     fn record_num(&mut self, prog: &str, kind: &str, area: &str, msg: &str, seed_label: &str) {
         let sig = format!("numref__{kind}__{area}");
         let cnt = self.per_sig.entry(sig.clone()).or_insert(0);
@@ -1162,6 +1332,12 @@ fn main() {
                 println!(";; case {seed}:{i}\n{}", render_program(&p.0));
             }
         }
+        Some("rxsample") => {
+            // rktgen rxsample <build-dir> <seed>: an rxref program
+            let script = PathBuf::from(&args[2]).join("harness/rxref.py");
+            let mut rc = RxCtx { py: spawn_py(&script), script };
+            print!("{}", rc.gen(args[3].parse().unwrap()).unwrap_or_default());
+        }
         Some("numsample") => {
             let seed: u64 = args[2].parse().unwrap();
             let mut g = num::NumGen::new(seed);
@@ -1194,6 +1370,8 @@ fn main() {
             let mut search = Search { out: out.clone(), runner_src: runner, per_sig: HashMap::new(), shrinks_per_kind: HashMap::new() };
             let mut extra: BTreeMap<String, u64> = BTreeMap::new();
             let pyscript = build.join("harness/numref.py");
+            let rxscript = build.join("harness/rxref.py");
+            let mut rxctx = if rxscript.exists() && std::env::var("RKTGEN_NO_RXREF").is_err() { Some(RxCtx { py: spawn_py(&rxscript), script: rxscript.clone() }) } else { None };
             let mut numctx = if pyscript.exists() { Some(NumCtx { py: spawn_py(&pyscript), script: pyscript.clone() }) } else { None };
             let (mut cases, mut failures) = (0u64, 0u64);
             let only_variants: Option<Vec<&'static str>> = std::env::var("RKTGEN_VARIANTS").ok().map(|l| {
@@ -1243,6 +1421,19 @@ fn main() {
                     if let Some(nc) = numctx.as_mut() {
                         if mix(seed, 9_100_000 + cases) % 5 == 0 {
                             let failed = numref_case(&mut pair.borrow_mut(), nc, mix(seed, 9_200_000 + cases), &mut search, &mut extra);
+                            cases += 1;
+                            if failed { failures += 1; }
+                            if last_write.elapsed() > Duration::from_secs(5) {
+                                last_write = Instant::now();
+                                write_stats(&out, cases, failures, &extra, cases as f64 / t0.elapsed().as_secs_f64());
+                            }
+                            continue;
+                        }
+                    }
+                    // rxref (steering round 16): an eighth of the cases, outside ephyra
+                    if let Some(rc) = rxctx.as_mut() {
+                        if mix(seed, 9_300_000 + cases) % 8 == 0 {
+                            let failed = rxref_case(&mut pair.borrow_mut(), rc, mix(seed, 9_400_000 + cases), &mut search, &mut extra);
                             cases += 1;
                             if failed { failures += 1; }
                             if last_write.elapsed() > Duration::from_secs(5) {

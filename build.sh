@@ -49,6 +49,8 @@ mkdir -p "$BUILD/harness"
 cp "$HERE/racket/runner.rkt" "$BUILD/harness/runner.rkt"
 # numref oracle's independent reference evaluator (python3 -I, stdlib only)
 cp "$HERE/racket/numref.py" "$BUILD/harness/numref.py"
+# rxref oracle: regexp reference (python3 -I, stdlib re)
+cp "$HERE/racket/rxref.py" "$BUILD/harness/rxref.py"
 # Compile the runner to machine code so the interpreter server only
 # interprets the generated programs, not the runner itself.
 ( cd "$BUILD/harness" && "$RACKET" -l racket/base -l compiler/cm \

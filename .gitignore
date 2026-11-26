@@ -1,5 +1,3 @@
 gen/target/
 racket/compiled/
-gen/.ephyra/
-build/
-out/
+racket/__pycache__/
