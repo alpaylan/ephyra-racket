@@ -1215,6 +1215,7 @@
 ;; (same cause: triage port__value__lib-print, TMPDIR unset in the search)
 ;; (same cause: triage port__value__type-guard)
 ;; (same cause: triage portsplit__error__port-out)
+;; (same cause: triage portsplit__value__reentry, example runner predates this fix)
 (define pa:tmp-dir #f)
 (define (pa:find-tmp-dir)
   (or pa:tmp-dir
