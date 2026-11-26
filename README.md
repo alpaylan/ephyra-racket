@@ -3,8 +3,9 @@
 A harness that generates well-formed Racket modules and checks that Racket CS gives the same
 result when the same module is run in ways that must agree: machine code vs. the interpreter
 (`PLT_CS_INTERP=1`), optimizer toggles, `.zo` round trips, splitting a module into two (cross-module
-inlining), rewriting it through hygienic macros, GC stress, thread preemption, and the released
-Racket 9.3 as a second reference. Programs are generated and shrunk
+inlining), rewriting it through hygienic macros, GC stress, thread preemption, futures, port
+kinds, chaperones, top-level evaluation, and Chez compiler options; plus independent references:
+the released Racket 9.3, a Python evaluator for numeric expressions, and Python's `re` for regexps. Programs are generated and shrunk
 with [Ephyra](https://github.com/datadog-labs/ephyra), a property-based testing library for Rust.
 
 The generator and oracles were written by an automated agent loop driving Ephyra, seeded with the
@@ -16,17 +17,27 @@ oracle ideas of [racket-fuzz](https://github.com/samth/racket-fuzz) (no code is 
   function loses `set!` of a `let`-bound copy of its argument
 - [racket/racket#5689](https://github.com/racket/racket/issues/5689) (fixed): schemify: cross-module
   inlining loses `set!` of the inlined function's argument
-- [racket/racket#5690](https://github.com/racket/racket/issues/5690): re-entering a continuation
-  captured inside `fl+` mutates the flonum returned the first time
+- [racket/racket#5690](https://github.com/racket/racket/issues/5690) (fixed): re-entering a
+  continuation captured inside `fl+` mutates the flonum returned the first time
 - [racket/racket#5692](https://github.com/racket/racket/issues/5692): compiled `even?`/`odd?` on a
   non-integer flonum reports `fleven?`/`flodd?` instead of `even?`/`odd?`
 - [racket/racket#5695](https://github.com/racket/racket/issues/5695): `=` raises "no exact
   representation" for a fixnum above 2^53 and an inexact complex with an infinite or NaN part
+- [racket/racket#5697](https://github.com/racket/racket/issues/5697): `get-output-bytes` of 4096+
+  bytes in a future: internal error, then the process hangs
+- [racket/racket#5698](https://github.com/racket/racket/issues/5698): a nested future that captures
+  or aborts to a prompt fails with "no corresponding prompt" when a worker started the outer future
+- [racket/racket#5699](https://github.com/racket/racket/issues/5699): Racket CS `vector-fill!`
+  rejects a chaperoned or impersonated mutable vector
+- [racket/racket#5700](https://github.com/racket/racket/issues/5700): `regexp-match*` on a byte
+  string with start-pos > 0: look-behind in later matches sees bytes before start-pos
 
 ## Quick start
 
-Requirements: Rust (`cargo`), a C toolchain, `make`, `rsync`, `curl`, `python3` (the `ref93`
-findings' `repro.sh` uses it), and network access at build time: the Racket build fetches its
+Requirements: Rust (`cargo`), a C toolchain, `make`, `rsync`, `curl`, `python3` 3.11 or newer
+(the `numref` and `rxref` references run in it during the search, and some findings'
+`repro.sh` use it; `rxref` needs atomic groups in `re`, and its `\p{..}` checks follow Python's
+Unicode database; it has been run with Python 3.12), and network access at build time: the Racket build fetches its
 portable-bytecode boot files, and `build.sh` downloads the Racket 9.3 minimal release for the `ref93`
 variant (or set `REF93_SRC` to an installed 9.3 tree, or `REF93_TGZ` to its tarball). Linux x86_64 is
 what it has been run on.
@@ -168,7 +179,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `racket runner.rkt splitdump prog.rkt` prints the two modules. The split variants get ~half of
      the drawn cases (`VARIANT_DRAW` in main.rs). 30% of generated functions get a small body
      (depth 1-2) so they are under the inlining size limits.
-   - `macro`, `macrozo`, `macrosplit` (metamorphic, runner.rkt `macro-module`,
+   - `macro`, `macrozo`, `macrosplit` (metamorphic; runner.rkt `macro-module`,
      `macro-split`): the generated items are rewritten through hygienic macros defined in the module
      (expander: scope sets, re-represented as sorted lists with a Zobrist hash in f1a34e208d,
      2026-11-16; binding resolution, use-site scopes, serialization of syntax). Each macro expands to
@@ -196,7 +207,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (`local-expand` of the argument to core forms, or with a stop list, then re-expanded).
      `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten
      module(s). They get a third of the drawn cases.
-   - `opaque`, `opaquesplit` (metamorphic, runner.rkt `opaque-module`): selected
+   - `opaque`, `opaquesplit` (metamorphic; runner.rkt `opaque-module`): selected
      sites are wrapped in `(opq-v e)`, `opq-v` a module variable holding the identity that is
      `set!` once, so schemify and Chez cp0/cptypes cannot see through it: literals stop being
      constants, variable references lose known values/types, `(f a ...)` becomes `((opq-v f) a ...)`
@@ -211,7 +222,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (rumble control.ss metacontinuation frames, mark splices, winders). `ctlsplit` = split + zo.
      `racket runner.rkt macrodump prog.rkt <variant>` prints the rewritten module(s) for all four.
      The opaque/ctl variants get about a third of the drawn cases.
-   - `gc`, `gczo`, `gcsplit` (metamorphic, runner.rkt `gc-module`,
+   - `gc`, `gczo`, `gcsplit` (metamorphic; runner.rkt `gc-module`,
      `set-gc-knobs!`): garbage collection must not change results. They run on a fifth server
      (`e` in main.rs, started on first use) because the runner starts a background place there
      (a second Chez thread with `thread-preserve-ownership!`, rumble place.ss), which makes Chez
@@ -238,7 +249,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      They get about a quarter of the drawn cases. Cost: ~0.17-0.22 s per case vs 0.06 s default.
      A 25-program probe on the coverage build reached +12 000 C regions (gc.c, gc-par.inc,
      gc-oce.inc) over the cumulative profile.
-   - `ref93` (second reference, steering round 7): the same module, variant `none`, on a sixth
+   - `ref93` (second reference): the same module, variant `none`, on a sixth
      server (`f`, started on first use) running the released **Racket 9.3 CS** (minimal),
      which build.sh copies into `<build>/ref93` (from `$REF93_SRC` or the tarball `$REF93_TGZ` if set, else
      download.racket-lang.org) with the runner compiled by it in `<build>/harness93`. Compared
@@ -257,7 +268,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      bug fixed by patch 003), and known 9.3 bugs repaired in trunk that the generator hits
      (`skip_ref93_known_*`: programs with an unused local function, 8f67966b14; a 9.3-only
      "cannot modify a constant", schemify mutation tracking 0cd7dd3cc0/bc1b6eb434 — generated
-     programs never set! a constant; `expt` with -2^60, 45177e8405; programs that set `file-position` on an output string port, 9.3 leaves heap garbage in the gap past the end, ad7cb98405). Kinds: `ref93__value__*`, `ref93__error__*`. **Triage every
+     programs never set! a constant; `expt` with -2^60, 45177e8405; programs that set `file-position` on an output string port, 9.3 leaves heap garbage in the gap past the end, ad7cb98405). Kinds: `ref93__value__*`, `ref93__error__*`. **Check every
      ref93 finding against `git log v9.3..HEAD`** (regexp repairs, expt with
      most-negative-fixnum, log1+/atanh accuracy, Unicode 18, struct field limit, reader `#s`)
      before calling it a regression; also check whether trunk or 9.3 is the one that is wrong.
@@ -277,7 +288,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `equal?` of hashes; never iteration order). Area tags `lib-num`, `lib-numstr`, `lib-cmp`,
      `lib-string`, `lib-char`, `lib-bytes`, `lib-symbol`, `lib-regexp`, `lib-print`, `lib-list`,
      `lib-hash`, `lib-typed`.
-   - `local`, `localpart`, `localzo` (metamorphic, steering round 8; runner.rkt `local-module`):
+   - `local`, `localpart`, `localzo` (metamorphic; runner.rkt `local-module`):
      the generated module-level items (all for `local`; for `localpart`/`localzo` a suffix
      starting at an index chosen from the program text, the rest stays at module level) are
      moved into an internal-definition body, either `(define (main%) <items> (void)) (main%)` or a
@@ -292,7 +303,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (`letrec-syntaxes+values`, left to right) semantics give the same output. `localzo` =
      `localpart` + zo round trip. About a fifth of the drawn cases.
      `racket runner.rkt macrodump prog.rkt local` prints the rewrite.
-   - `preempt`, `preemptctl`, `preemptsplit` (metamorphic, steering round 9; runner.rkt
+   - `preempt`, `preemptctl`, `preemptsplit` (metamorphic; runner.rkt
      `preempt-module`, `start-preempt-helper!`): green-thread preemption must not change results.
      Racket threads are Chez engines (rumble engine.ss); when the engine timer runs out at an event
      check (procedure entry, loop back-edge) the timer interrupt captures the metacontinuation and
@@ -311,8 +322,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      count (≈ swaps) to stderr. The repro retries a matching variant run twice (swaps during
      compilation depend on timing). About a fifth of the drawn cases; `macrodump prog.rkt preempt`
      prints the rewrite.
-   - `common`, `noclos`, `notrap`, `dbg`, `noinl`, `chezmix`, `chezmixzo` (option toggles, steering
-     round 10; runner.rkt `set-chez-knobs!`): Chez compiler parameters Racket never changes, so
+   - `common`, `noclos`, `notrap`, `dbg`, `noinl`, `chezmix`, `chezmixzo` (option toggles; runner.rkt `set-chez-knobs!`): Chez compiler parameters Racket never changes, so
      their code paths in the Chez compiler were never exercised. `common`: `commonization-level`
      1-9 (cpcommonize, merging similar lambdas; CSUG: commonization "should not affect the
      behavior of the program"); `noclos`: internal `$optimize-closures #f` + `$lift-closures #f`
@@ -328,7 +338,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      the same with a zo round trip of each module. `macrodump prog.rkt chezmix` prints the rewrite.
      Not used: `compile-profile 'block` (no counters without source objects), `$loop-unroll-limit`
      (np-profile-unroll-loops is "disabled for now" in cpnanopass.ss). About a fifth of the draws.
-   - `future`, `futurezo`, `futuresplit`, `gcfuture` (metamorphic, steering round 11; runner.rkt
+   - `future`, `futurezo`, `futuresplit`, `gcfuture` (metamorphic; runner.rkt
      `future-module`): the opaque sites are evaluated as `(fut-v (lambda () e))`, i.e.
      `(touch (future thunk))` after spinning 0/300/3000/30000 iterations (per program) until a
      future worker pthread has started the thunk (an fsemaphore it posts). So `e` runs on another
@@ -356,7 +366,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      Racket thread; re-entering a `call/cc` continuation captured in the inner future from the outer
      future's thunk hangs the process (does not even react to SIGTERM) or raises "touch: future
      previously aborted" (all three seen on trunk and 9.3). About 1/7 of the draws. `macrodump prog.rkt future` prints the rewrite.
-   - `port`, `portsplit` (metamorphic, steering round 12; runner.rkt `port-module`,
+   - `port`, `portsplit` (metamorphic; runner.rkt `port-module`,
      `port-alt-forms`): every `open-input-bytes`, `open-input-string`, `open-output-bytes`,
      `open-output-string`, `get-output-bytes`, `get-output-string` of the program is renamed to a
      `pa:` version (defined at the end of the prelude) that returns a port of another kind with the
@@ -379,7 +389,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      only extends capacity by bytes actually peeked — checked on trunk and 9.3), avail/non-blocking
      reads (counts may differ legitimately), `get-output-bytes` with reset (custom ports keep their
      own position). `portsplit` = split + zo round trip. Port names are all `'string`, so messages
-     agree. `RKT_PORT_KIND=k` / `RKT_PORT_OKIND=k` force one kind (triage), `RKT_PORT_DEBUG=1`
+     agree. `RKT_PORT_KIND=k` / `RKT_PORT_OKIND=k` force one kind (for debugging), `RKT_PORT_DEBUG=1`
      prints the number of ports made. Programs without `(open-` run `opaque` instead.
      The generator got port constructs (gen.rs `port_in`, `port_out`, 1/6 of `lib_op`): an input
      port on tricky data (line endings, readable data, UTF-8 and invalid bytes, data across the
@@ -404,7 +414,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      now any line that is not a result line makes the server count as dead (`died`, the lines are
      in the message) and the server is killed; the variant repro retries a died future case up to
      8 times with a 45 s limit and accepts an `internal-error:` line as reproduction.
-   - `top`, `topzo`, `topsplit` (metamorphic, steering round 13; runner.rkt `run-top`,
+   - `top`, `topzo`, `topsplit` (metamorphic; runner.rkt `run-top`,
      `top-body-forms`): the module's body forms are evaluated one by one at the top level of the
      fresh `racket/base` namespace instead of as a module. Each form is its own top-level linklet
      (expander compile/top.rkt, eval/top.rkt; optimized, machine code), module definitions become
@@ -430,7 +440,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      a second time, unchanged, at a later position (the top level allows redefinition, a lambda
      definition has no other effect, so callers compiled earlier — or in the same compiled begin —
      must see an equivalent procedure: no stale known-procedure or inlining assumptions).
-   - `rtrip`, `rtripzo` (run-time round trips, steering round 13; runner.rkt `rt-module`,
+   - `rtrip`, `rtripzo` (run-time round trips; runner.rkt `rt-module`,
      `rt-defs`): the opaque sites are wrapped in `(rt-v e)`, which returns e's value unchanged
      after checking documented round trips on it: `write` then `read` gives an `equal?` value
      (printer.scrbl: "write mode prints core datatypes in such a way that using read on the output
@@ -447,7 +457,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      First 3000 sites per case, values written in under 20 000 chars. `rtripzo` = + zo round trip.
      About 1/14 of the draws. Probes: 950 programs x 2 clean after restricting non-equal? table
      keys (a copied mutable-string key is a new object for eqv?, correctly not `equal?`).
-   - `chap`, `chapzo`, `chapsplit` (metamorphic, steering round 15; runner.rkt `ch-module`,
+   - `chap`, `chapzo`, `chapsplit` (metamorphic; runner.rkt `ch-module`,
      `ch-defs`): the opaque sites are wrapped in `(ch-v e)`, which returns e's value inside an
      identity chaperone or impersonator when it is a vector (`chaperone-vector`/`-vector*`, `#f`
      procs, `impersonate-vector` for mutable ones), box, hash table (with and without clear and
@@ -496,7 +506,7 @@ written as a finding (max 3 per signature, max 40 shrinks per oracle kind per ru
 starts with a derived seed. `repro.sh` runs `prog.rkt` through its own copy of `runner.rkt` in both
 modes against the given build and exits 1/0/2.
 
-4. **numref** (`numref__{value,error,ivalue,ierror,uvalue,uerror,died,udied}__<op>`, steering round 14):
+4. **numref** (`numref__{value,error,ivalue,ierror,uvalue,uerror,died,udied}__<op>`):
    an independent second reference for the numeric library both trunk modes share. Every
    oracle above compares Racket with Racket, so a wrong result computed by code that machine
    code and the interpreter both call (Chez's C `number.c` bignum arithmetic, `mathprims.ss`/
@@ -549,10 +559,10 @@ modes against the given build and exits 1/0/2.
    "Coerces") — treat a mismatch there as a watch item until the closest-value claim is
    confirmed. Stats: `numref_cases`, `numref_pass`, `numref_unsafe`, `numref_skip`,
    `numref_gen_errors` (module raised or a line is missing: generator bug, should stay 0),
-   `numref_py_lost`, `fail_numref_*`. Before round 14, 2400 programs (~60 000 expressions) passed
-   on trunk+patches.
+   `numref_py_lost`, `fail_numref_*`. Before this oracle was added, 2400 programs (~60 000 expressions) passed
+   on trunk with fixes for the bugs found so far.
 
-5. **rxref** (`rxref__{value,error,died}__<mode>-<area>`, steering round 16): a second reference for
+5. **rxref** (`rxref__{value,error,died}__<mode>-<area>`): a second reference for
    the regexp matcher (racket/src/regexp, shared by every mode, so no Racket-vs-Racket oracle sees
    it). An eighth of the cases (`mix(seed, 9_300_000 + case) % 8 == 0`, outside ephyra) are
    programs from `racket/rxref.py gen`: 3-5 lines, each a generated pregexp (literals incl.
@@ -621,7 +631,7 @@ modes against the given build and exits 1/0/2.
 `server_restarts`, `segments`. `rktgen norm93 prog.rkt < result-lines` prints the ref93
 comparison form.
 
-Round 7 check (patched base build, 8 x 700 s + 4 x 500 s): ~28 000 cases, ~4 100 ref93
+Check of the ref93 oracle (a trunk build with fixes for the bugs found so far applied, 8 x 700 s + 4 x 500 s): ~28 000 cases, ~4 100 ref93
 comparisons, 0 failures; one earlier ref93 finding was a 9.3 bug repaired in trunk (8f67966b14),
 now skipped. On the unpatched trunk the old clusters (composable, splitmi set) still appear
 within minutes.
@@ -644,17 +654,17 @@ Scheme-level code (schemify, expander, the Chez compiler passes where most bugs 
 to LLVM coverage; trunk has no Scheme-level coverage counters. A 30 s run reached 39% of
 functions / 29% of lines of the instrumented C.
 
-Round 10 check (a trunk build with fixes for the bugs found so far, 4 x 600 s + 4 x 360 s, ~14 000 cases): 300 sampled programs x 7 knob
+Check of the Chez option toggles (a trunk build with fixes for the bugs found so far, 4 x 600 s + 4 x 360 s, ~14 000 cases): 300 sampled programs x 7 knob
 variants gave no differences; the search found 6 `*__internal__*` findings (chezmixzo, notrap,
 common), all the same Chez crash: with `$enable-check-prelex-flags` on, `compile-to-port` of
 `(lambda (t) (real->flonum (+ 5 (length t))))` (also `(inexact (if (fixnum? t) (+ t 1) 1))`)
 dies with "invalid memory reference"; it needs cptypes (`enable-type-recovery #f` avoids it).
 
-Round 11 check (same kind of build, 4 x 360 s, 6 669 cases): 4 failures (0.06%), all
+Check of the future variants (same kind of build, 4 x 360 s, 6 669 cases): 4 failures (0.06%), all
 future variants, all nested-future continuation failures (futuresplit reentry/composable, futurezo
 composable/reentry); 500 sampled programs x 4 future variants gave 2 programs differing (both nested).
 
-Round 12 check (same kind of build, 3 x (4 x 420-480 s), ~27 000 cases, ~950 port /
+Check of the port variants (same kind of build, 3 x (4 x 420-480 s), ~27 000 cases, ~950 port /
 portsplit comparisons): 582 sampled port programs x {port, portsplit} gave no differences; two
 harness false positives found and fixed (bad arguments to `pa:open-input-bytes` from the shrinker;
 racket/port `*-evt` on ports without progress events, which port-lib.scrbl excludes). The remaining
