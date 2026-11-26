@@ -90,7 +90,7 @@
                    "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"
                    "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"
                    "common" "noclos" "notrap" "dbg" "noinl" "chezmix" "chezmixzo"
-                   "future" "futurezo" "futuresplit" "gcfuture"))
+                   "future" "futurezo" "futuresplit" "gcfuture" "port" "portsplit"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -973,123 +973,217 @@
      (define (local-print% . vs) (for-each (current-print) vs))
      ,@keep ,@wrapped))
 
-;; ---------------------------------------------------------------------
-;; Preemption (variants preempt, preemptctl, preemptsplit; steering round 9).
-;; Racket threads are Chez engines (rumble engine.ss): when the engine's
-;; timer runs out at an event check (procedure entry, loop back-edge), the
-;; timer interrupt captures the metacontinuation and the scheduler swaps in
-;; another thread; the case thread resumes later where it stopped.  With the
-;; default quantum (thread/config.rkt TICKS 100000) that happens a handful of
-;; times per case at the same few places.  Here the opaque sites are wrapped
-;; in `(pre-v e)`, which evaluates `e`, then lowers the remaining ticks to
-;; 1..K (K per program: 2, 8, 32 or 400), so the interrupt fires at an
-;; arbitrary later event check, also inside loops with unboxed flonum locals,
-;; inside prompts, dynamic-wind, parameterize, marks, handlers and
-;; continuation applications.  A helper green thread (created by the runner,
-;; its output discarded) is always runnable: it yields with `(sleep 0)` inside
-;; its own parameterize + continuation mark and checks that both, a flonum
-;; accumulator and a ring of vectors survive the swaps; a failure becomes an
-;; `internal error` result line.  Expected: thread switches are not
-;; observable by a program that does not share state with other threads
-;; (reference/threads.scrbl: threads run concurrently; nothing allows a
-;; context switch to change a single thread's results), so the output must
-;; equal the default run's.
-(define (preempt-defs src)
-  (define rng (macro-rng (string-append "preK" src)))
-  `((require (only-in ffi/unsafe/vm vm-primitive))
-    (define pre-st (vm-primitive 'set-timer))
-    (define pre-n 0)
-    (define (pre-v x)
-      (set! pre-n (add1 pre-n))
-      (let ([o (pre-st 0)])
-        (pre-st (if (> o 0) (min o (add1 (modulo (* pre-n 7919) ,(vector-ref #(2 8 32 400) (rng 4))))) 0)))
-      x)))
-
-(define (preempt-variant? v) (member v '("preempt" "preemptctl" "preemptsplit")))
-
-(define (preempt-module form src [ctl? #f])
-  (define lang (caddr form))
+;; Metamorphic port variants (steering round 12): every string/bytes port
+;; of the program is replaced by a port of another kind with the same
+;; content (definitions in `port-alt-forms`, kinds per call from a vector
+;; chosen from the program text).  Expected: reference ports.scrbl /
+;; custom-ports.scrbl / pipes.scrbl -- a port's content is the bytes it
+;; delivers, blocking reads/peeks return the same bytes whatever the chunking,
+;; file-position of a non-file input port is the number of bytes read, etc.
+(define port-renames
+  '((open-input-bytes . pa:open-input-bytes) (open-input-string . pa:open-input-string)
+    (open-output-bytes . pa:open-output-bytes) (open-output-string . pa:open-output-string)
+    (get-output-bytes . pa:get-output-bytes) (get-output-string . pa:get-output-string)))
+(define (port-variant? v) (member v '("port" "portsplit")))
+(define (port-module form src)
+  (define rng (macro-rng (string-append "port" src)))
   (define-values (pre items) (split-prelude (cdddr form)))
-  (define rng (macro-rng (string-append "preempt" src)))
-  `(module m ,lang ,@pre ,@(preempt-defs src) ,@(if ctl? ctl-defs '())
-     ,@(opaque-rewrite-items items (cdddr form) rng (if ctl? 'prectl 'pre))))
-
-(define pre-param (make-parameter 0))
-(define pre-swaps 0)   ; helper iterations (RKT_PRE_DEBUG prints them)
-;; the helper thread; sets `fail` to a message when a check fails
-(define (start-preempt-helper! fail)
-  (parameterize ([current-output-port (open-output-nowhere)]
-                 [current-error-port (open-output-nowhere)])
-    (thread
-     (lambda ()
-       (with-handlers ([(lambda (e) #t)
-                        (lambda (e) (set-box! fail (format "helper raised ~a"
-                                                           (if (exn? e) (first-line (exn-message e)) e))))])
-         (define ring (make-vector 32 #f))
-         (let loop ([i 0] [acc 0.0])
-           (define v (vector i (exact->inexact i) (list i (number->string i))))
-           (vector-set! ring (modulo i 32) v)
-           (parameterize ([pre-param i])
-             (with-continuation-mark 'pre-key i
-               (begin
-                 (sleep 0)
-                 (unless (and (eqv? (pre-param) i)
-                              (eqv? (continuation-mark-set-first #f 'pre-key) i))
-                   (set-box! fail "helper's parameterization or mark changed across a swap"))
-                 (void))))
-           (unless (fl= acc (fl* (->fl i) 0.25))
-             (set-box! fail "helper's flonum accumulator changed across a swap"))
-           (when (>= i 32)
-             (define old (vector-ref ring (modulo (- i 31) 32)))
-             (define k (- i 31))
-             (unless (and (eqv? (vector-ref old 0) k) (eqv? (vector-ref old 1) (exact->inexact k))
-                          (equal? (vector-ref old 2) (list k (number->string k))))
-               (set-box! fail "helper's ring vector changed across a swap")))
-           (set! pre-swaps (add1 pre-swaps))
-           (unless (unbox fail) (loop (add1 i) (fl+ acc 0.25)))))))))
-
-;; ---------------------------------------------------------------------
-;; Metamorphic "local" rewrite (variants local, localpart; steering round 8).
-;; The generated module-level items (all of them for `local`, a suffix
-;; chosen from the program text for `localpart`) are moved into the body of
-;; a function, an internal-definition context:
-;;   (define (main%) <items'> (void)) (main%)       ; or
-;;   (let () <items'> (void))                       ; a module-level expression
-;; Module-level definitions (constants for schemify, known procedures,
-;; cross-form inlining) become letrec* bindings of one closure body: Chez
-;; cpletrec, closure conversion, local set! boxes, schemify's lift and
-;; mutated-state analysis, inlining by cp0 instead of schemify.  A module body
-;; prints the values of its expression forms with `current-print` and runs
-;; each in a prompt for the default tag (reference/syntax.scrbl `module`);
-;; an internal body discards them, so each expression item e becomes
-;; (call-with-values (lambda () e) local-print%), and half of the programs
-;; also wrap it in `call-with-continuation-prompt`.  Definitions keep their
-;; order; generated names are unique and only refer to earlier definitions
-;; (valid_program), so letrec* semantics equal the module's.  Expected:
-;; reference/syntax.scrbl, internal definitions are `letrec-syntaxes+values`
-;; with the same left-to-right evaluation; output must be identical.
-(define (local-module form src [part? #f])
-  (define lang (caddr form))
-  (define-values (pre items) (split-prelude (cdddr form)))
-  (define rng (macro-rng (string-append (if part? "localpart" "local") src)))
-  (define k (if part? (rng (add1 (length items))) 0))
-  (define-values (keep moved) (split-at items k))
-  (define prompt? (zero? (rng 2)))
-  (define (def? f) (and (pair? f) (memq (car f) '(define define-values))))
-  (define body
-    (for/list ([f moved])
-      (cond [(def? f) f]
-            [prompt? `(call-with-values
-                       (lambda () (call-with-continuation-prompt (lambda () ,f)))
-                       local-print%)]
-            [else `(call-with-values (lambda () ,f) local-print%)])))
-  (define wrapped
-    (if (zero? (rng 2))
-        `((define (main%) ,@body (void)) (main%))
-        `((let () ,@body (void)))))
-  `(module m ,lang ,@pre
-     (define (local-print% . vs) (for-each (current-print) vs))
-     ,@keep ,@wrapped))
+  ;; output positions set: only seekable output kinds (bytes port, file)
+  (define seek? (regexp-match? #px"\\(file-position [^ ()]+ " src))
+  (define nk 12)
+  (define pool (if (zero? (rng 3)) (for/list ([i 3]) (rng nk)) (range nk)))
+  (define kinds (for/vector ([i 64]) (list-ref pool (rng (length pool)))))
+  (define okinds (for/vector ([i 64]) (rng 4)))
+  ;; triage: RKT_PORT_KIND / RKT_PORT_OKIND force one kind for every port
+  (define (force v e) (let ([k (getenv e)]) (if k (make-vector 64 (string->number k)) v)))
+  (set! kinds (force kinds "RKT_PORT_KIND"))
+  (set! okinds (force okinds "RKT_PORT_OKIND"))
+  (define (walk e)
+    (cond [(symbol? e) (let ([r (assq e port-renames)]) (if r (cdr r) e))]
+          [(and (pair? e) (eq? (car e) 'quote)) e]
+          [(pair? e) (cons (walk (car e)) (walk (cdr e)))]
+          [else e]))
+  `(module m ,(caddr form) ,@(drop-right pre 1)
+     (define pa:kinds ',kinds)
+     (define pa:okinds ',okinds)
+     (define pa:seek? ,seek?)
+     ,@port-alt-forms
+     ,(last pre)
+     ,@(map walk items)))
+(define port-alt-forms
+  '(
+;; Definitions injected by runner.rkt's `port-module` (variants `port`,
+;; `portsplit`) at the end of the prelude.  Every `open-input-bytes`,
+;; `open-input-string`, `open-output-bytes`, `open-output-string`,
+;; `get-output-bytes`, `get-output-string` of the program is renamed to the
+;; `pa:` version below, which builds a port of another kind with the same
+;; content (kind per call from `pa:kinds`, a vector literal the runner adds
+;; in front of these forms; `pa:okinds` for output ports, `pa:seek?` when the
+;; program sets output positions, so only seekable output kinds are used).
+;; Read as data by runner.rkt (one form after another).
+(require (only-in racket/port input-port-append make-limited-input-port peeking-input-port
+                  make-input-port/read-to-peek reencode-input-port port->bytes))
+(define pa:n 0)
+(define (pa:next v)
+  (define k (vector-ref v (modulo pa:n (vector-length v))))
+  (set! pa:n (add1 pa:n))
+  k)
+;; chunk sizes delivered by custom ports, cycling per port
+(define (pa:csize i) (vector-ref '#(1 3 100000 2 1 7 4096 5) (modulo i 8)))
+(define (pa:valid-utf-8? b) (and (bytes-utf-8-length b #f) #t))
+(define pa:tmp-k 0)
+(define (pa:tmp-path)
+  (set! pa:tmp-k (add1 pa:tmp-k))
+  (build-path (find-system-path 'temp-dir)
+              (format "rktpa-~a-~a-~a" (current-inexact-milliseconds) (eq-hash-code (box 0)) pa:tmp-k)))
+(define (pa:custom-in b peek? start)
+  (define pos 0)
+  (define n (bytes-length b))
+  (define calls start)
+  (define (next!) (set! calls (add1 calls)) (pa:csize calls))
+  (make-input-port
+   'string
+   (lambda (dst)
+     (if (>= pos n)
+         eof
+         (let ([m (min (bytes-length dst) (- n pos) (next!))])
+           (bytes-copy! dst 0 b pos (+ pos m))
+           (set! pos (+ pos m))
+           m)))
+   (and peek?
+        (lambda (dst skip evt)
+          (let ([s (+ pos skip)])
+            (if (>= s n)
+                eof
+                (let ([m (min (bytes-length dst) (- n s) (next!))])
+                  (bytes-copy! dst 0 b s (+ s m))
+                  m)))))
+   void))
+(define (pa:read-to-peek b start)
+  (define pos 0)
+  (define n (bytes-length b))
+  (define calls start)
+  (make-input-port/read-to-peek
+   'string
+   (lambda (dst)
+     (if (>= pos n)
+         eof
+         (begin
+           (set! calls (add1 calls))
+           (let ([m (min (bytes-length dst) (- n pos) (pa:csize calls))])
+             (bytes-copy! dst 0 b pos (+ pos m))
+             (set! pos (+ pos m))
+             m))))
+   #f
+   void))
+(define (pa:pieces b k)
+  ;; split b into pieces at deterministic cut points (some empty)
+  (define n (bytes-length b))
+  (let loop ([i 0] [j k] [acc '()])
+    (if (>= i n)
+        (reverse (cons #"" acc))
+        (let ([m (min (- n i) (modulo (* 5 j) 7))])
+          (loop (+ i m) (add1 j) (cons (subbytes b i (+ i m)) acc))))))
+(define (pa:open-input-bytes b [name 'string])
+  ;; bad arguments (the shrinker makes them): the original's error
+  (unless (bytes? b) (open-input-bytes b name))
+  (define k (pa:next pa:kinds))
+  (define b* (bytes->immutable-bytes (bytes-copy b)))
+  (case k
+    [(0) (open-input-bytes b* name)]
+    [(1) (pa:custom-in b* #f k)]
+    [(2) (pa:custom-in b* #t k)]
+    [(3) (pa:read-to-peek b* k)]
+    [(4) (let-values ([(i o) (make-pipe #f 'string 'string)])
+           (write-bytes b* o)
+           (close-output-port o)
+           i)]
+    ;; (not a limited pipe: a blocking peek beyond the limit waits forever,
+    ;; pipes.scrbl: capacity is extended only by bytes actually peeked)
+    [(5) (let-values ([(i o) (make-pipe #f 'string 'string)])
+           (thread (lambda ()
+                     (for ([piece (in-list (pa:pieces b* pa:n))])
+                       (write-bytes piece o)
+                       (sleep 0))
+                     (close-output-port o)))
+           i)]
+    [(6) (apply input-port-append #t (map open-input-bytes (pa:pieces b* k)))]
+    [(7) (peeking-input-port (open-input-bytes b*) 'string)]
+    [(8) (make-limited-input-port (open-input-bytes (bytes-append b* #"(tail \"x\n")) (bytes-length b*))]
+    [(9) (if (pa:valid-utf-8? b*)
+             (reencode-input-port (open-input-bytes b*) "UTF-8" #f #f 'string)
+             (pa:custom-in b* #t k))]
+    [(10) (let ([f (pa:tmp-path)])
+            (call-with-output-file f (lambda (o) (write-bytes b* o)) #:exists 'truncate)
+            (begin0 (open-input-file f) (delete-file f)))]
+    [else (let-values ([(i o) (make-pipe #f 'string 'string)])
+            ;; unlimited pipe filled by a thread, closed at the end
+            (thread (lambda ()
+                      (for ([piece (in-list (pa:pieces b* (add1 pa:n)))])
+                        (write-bytes piece o))
+                      (close-output-port o)))
+            i)]))
+(define (pa:open-input-string s [name 'string])
+  (unless (string? s) (open-input-string s name))
+  (pa:open-input-bytes (string->bytes/utf-8 s) name))
+;; output ports: a struct-free registry from port to its content getter
+(define pa:getters (make-weak-hasheq))
+(define (pa:open-output-bytes [name 'string])
+  (define k (if pa:seek? (vector-ref '#(0 3) (modulo (pa:next pa:okinds) 2)) (pa:next pa:okinds)))
+  (case k
+    [(0) (open-output-bytes name)]
+    [(1) (define inner (open-output-bytes))
+         (define calls k)
+         (define o
+           (make-output-port
+            'string always-evt
+            (lambda (bs start end non-block? breakable?)
+              (if (= start end)
+                  0
+                  (begin
+                    (set! calls (add1 calls))
+                    (let ([m (min (- end start) (pa:csize calls))])
+                      (write-bytes bs inner start (+ start m))
+                      m))))
+            void))
+         (hash-set! pa:getters o (lambda () (flush-output o) (get-output-bytes inner)))
+         o]
+    [(2) (define-values (i o) (make-pipe #f 'string 'string))
+         (define acc (open-output-bytes))
+         (define buf (make-bytes 37))
+         (hash-set! pa:getters o
+                    (lambda ()
+                      (let loop ()
+                        (define m (read-bytes-avail!* buf i))
+                        (when (and (exact-integer? m) (positive? m))
+                          (write-bytes buf acc 0 m)
+                          (loop)))
+                      (get-output-bytes acc)))
+         o]
+    [else (define f (pa:tmp-path))
+          (define o (open-output-file f #:exists 'truncate))
+          (define i (open-input-file f))
+          (delete-file f)
+          (hash-set! pa:getters o
+                     (lambda ()
+                       (flush-output o)
+                       (file-position i 0)
+                       (let ([r (read-bytes 100000000 i)]) (if (eof-object? r) #"" r))))
+          o]))
+(define (pa:open-output-string [name 'string]) (pa:open-output-bytes name))
+(define (pa:get-output-bytes o . more)
+  (define g (hash-ref pa:getters o #f))
+  (cond [(not g) (apply get-output-bytes o more)]
+        [(null? more) (g)]
+        [else (let* ([bs (g)]
+                     [start (if (>= (length more) 2) (cadr more) 0)]
+                     [end (if (>= (length more) 3) (caddr more) (bytes-length bs))])
+                (subbytes bs start end))]))
+(define (pa:get-output-string o . more)
+  (if (hash-ref pa:getters o #f)
+      (bytes->string/utf-8 (apply pa:get-output-bytes o more) #\uFFFD)
+      (apply get-output-string o more)))
+))
 
 (define (variant-source variant src)
   (if (equal? variant "unsafe")
@@ -1161,7 +1255,7 @@
 
 (define (fresh-ns)
   (define ns (make-base-namespace))
-  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list ffi/unsafe/vm racket/future)])
+  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list ffi/unsafe/vm racket/future racket/port)])
     (namespace-attach-module orig-ns m ns))
   ns)
 
@@ -1261,11 +1355,17 @@
                       (for ([f (split-module (future-module form src))])
                         (eval (zo-round-trip (compile f))))]
                      [("gcfuture") (eval (future-module form src #t))]
+                     [("port") (eval (port-module form src))]
+                     [("portsplit")
+                      (for ([f (split-module (port-module form src))])
+                        (eval (zo-round-trip (compile f))))]
                      [("chezmix") (for ([f (chezmix-forms form src)]) (eval f))]
                      [("chezmixzo")
                       (for ([f (chezmix-forms form src)]) (eval (zo-round-trip (compile f))))]
                      [else (eval form)])
                    (dynamic-require ''m #f)
+                   (when (and (equal? variant "port") (getenv "RKT_PORT_DEBUG"))
+                     (eprintf "ports made: ~a\n" (eval 'pa:n (module->namespace ''m))))
                    (when (equal? variant "macrosub")
                      (dynamic-require '(submod 'm sub) #f))
                    (list "ok" (get-output-string out)))))))))
@@ -1352,6 +1452,8 @@
                 [("future" "futurezo") (list (future-module form src))]
                 [("futuresplit") (split-module (future-module form src))]
                 [("gcfuture") (list (future-module form src #t))]
+                [("port") (list (port-module form src))]
+                [("portsplit") (split-module (port-module form src))]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])

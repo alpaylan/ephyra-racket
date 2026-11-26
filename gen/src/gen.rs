@@ -1249,6 +1249,22 @@ const RX_POOL: &[&str] = &[
     "#rx\"(?i:hello)\"", "#px\"a{2,3}\"", "#rx\"x*\"", "#px\"\\\\bW\"",
 ];
 
+/// Port contents (steering round 12): line endings, readable data, UTF-8
+/// and invalid sequences, data across the 4096-byte port buffer.
+const PORT_DATA_POOL: &[&str] = &[
+    "#\"line1\\nline2\\r\\nl3\\rlast\"", "#\"(1 2) #(a \\\"b\\\") 3.5 sym ; c\\n#t\"",
+    "#\"\\303\\251t\\303\\251\\n\\360\\237\\230\\200\\200x\"", "#\"a\\tb\\tc\\n\\n\"", "#\"\"", "#\"x\"",
+    "(bytes-append (make-bytes 4094 97) #\"\\r\\n\\303\\251(x . y) z\")", "(make-bytes 4097 10)",
+    "#\"ab(c\\r\\n12 345\\r\"", "#\"#hash((1 . 2)) \\\"s\\\\n\\\" #\\\\x 1/2 -0.0\"", "#\"\\377\\376\\0zz\\n\"",
+    "(bytes-append #\"(\" (make-bytes 5000 49) #\")\")",
+];
+const PORT_RX_POOL: &[&str] = &[
+    "#rx\"[0-9]+\"", "#rx#\"\\n\"", "#px\"(?<=a)b\"", "#rx\"$\"", "#rx\"^a*\"", "#px\"\\\\s+\"", "#rx\"(x|\u{e9})\"",
+    "#px\"\\\\p{Ll}+\"", "#rx#\"[\\200-\\377]+\"", "#rx\"zz\"", "#px\"(?<!a)[(]\"", "#rx\"a(?=b)\"", "#rx\"\\r\\n|\\r|\\n\"",
+    "#rx\"\"", "#px\"[a-z]{2,}\"",
+];
+const LINE_MODES: &[&str] = &["'linefeed", "'return", "'return-linefeed", "'any", "'any-one"];
+
 impl<'a> Gen<'a> {
     fn lib_lit(&mut self, pool: &[&'static str]) -> E {
         E::atom(Ty::Val, self.rng.pick(pool))
@@ -1412,11 +1428,140 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// A byte count / skip for port operations.
+    fn port_n(&mut self, d: usize) -> E {
+        match self.rng.below(8) {
+            0..=3 => self.small_lit(0, 8),
+            4 => E::atom(Ty::Int, self.rng.pick(&["4093", "4094", "4095", "4096", "4097", "5000", "100000"])),
+            5 => self.small_lit(9, 40),
+            _ => { let e = self.lib_int(d); E::node(Ty::Int, "", "(modulo $0 9)", vec![e]) }
+        }
+    }
+    fn port_data(&mut self, d: usize) -> E {
+        match self.rng.below(10) {
+            0..=5 => self.lib_lit(PORT_DATA_POOL),
+            6 => self.lib_lit(BYTES_POOL),
+            7 => { let s = self.lib_str(d); E::node(Ty::Val, "", "(string->bytes/utf-8 $0)", vec![s]) }
+            _ => { let a = self.lib_lit(PORT_DATA_POOL); let b = self.lib_lit(PORT_DATA_POOL); E::node(Ty::Val, "", "(bytes-append $0 $1)", vec![a, b]) }
+        }
+    }
+    /// One operation on input port `p` (bound by the enclosing port_in).
+    fn port_in_op(&mut self, p: &String, d: usize) -> E {
+        let rd = "(with-handlers ([exn:fail:read? (lambda (e) 'read-error)]) ";
+        let (tpl, kids): (String, Vec<E>) = match self.rng.below(33) {
+            0 => (format!("(read-byte {p})"), vec![]),
+            1 => (format!("(peek-byte {p} $0)"), vec![self.port_n(d)]),
+            2 => (format!("(read-char {p})"), vec![]),
+            3 => (format!("(peek-char {p} $0)"), vec![self.port_n(d)]),
+            4 | 5 => (format!("(read-bytes $0 {p})"), vec![self.port_n(d)]),
+            6 => (format!("(peek-bytes $0 $1 {p})"), vec![self.port_n(d), self.port_n(d)]),
+            7 => (format!("(read-string $0 {p})"), vec![self.port_n(d)]),
+            8 => (format!("(peek-string $0 $1 {p})"), vec![self.port_n(d), self.port_n(d)]),
+            9 => { let m = *self.rng.pick(LINE_MODES); (format!("(read-line {p} {m})"), vec![]) }
+            10 => { let m = *self.rng.pick(LINE_MODES); (format!("(read-bytes-line {p} {m})"), vec![]) }
+            11 | 12 => {
+                let op = *self.rng.pick(&["regexp-match", "regexp-match-positions", "regexp-try-match", "regexp-match-peek", "regexp-match-peek-positions", "regexp-match?"]);
+                (format!("({op} $0 {p})"), vec![self.lib_lit(PORT_RX_POOL)])
+            }
+            13 => {
+                let op = *self.rng.pick(&["regexp-match", "regexp-match-positions", "regexp-match-peek-positions"]);
+                (format!("({op} $0 {p} $1)"), vec![self.lib_lit(PORT_RX_POOL), self.port_n(d)])
+            }
+            14 => (format!("{rd}(read {p}))"), vec![]),
+            15 => (format!("{rd}(let ([s (read-syntax 'src {p})]) (if (eof-object? s) s (list (syntax->datum s) (syntax-line s) (syntax-column s) (syntax-position s) (syntax-span s)))))"), vec![]),
+            16 | 17 => (format!("(file-position {p})"), vec![]),
+            18 => (format!("(call-with-values (lambda () (port-next-location {p})) list)"), vec![]),
+            19 => (format!("(let ([bf (make-bytes 6 46)]) (list (read-bytes! bf {p} 1 (min 6 (+ 1 $0))) bf))"), vec![self.port_n(d)]),
+            20 => (format!("(let ([bf (make-bytes 6 46)]) (list (peek-bytes! bf $0 {p} 2) bf))"), vec![self.port_n(d)]),
+            21 => (format!("(eof-object? (peek-byte {p}))"), vec![]),
+            22 => (format!("(let ([r (read-bytes 100000 {p})]) (if (bytes? r) (list (bytes-length r) (subbytes r (max 0 (- (bytes-length r) 9)))) r))"), vec![]),
+            23 => (format!("(let ([c (read-char {p})]) (list c (peek-char {p}) (read-char {p})))"), vec![]),
+            // avail reads completed by blocking reads: deterministic content
+            24 => (format!("(let* ([k (min 5000 $0)] [bf (make-bytes k 46)] [n ({av} bf {p})] [m (if (and (exact-integer? n) (< n k)) (read-bytes! bf {p} n k) 0)]) (if (or (eof-object? n) (and (eqv? n 0) (eof-object? m))) eof (subbytes bf 0 (+ n (if (exact-integer? m) m 0)))))", av = self.rng.pick(&["read-bytes-avail!", "read-bytes-avail!*"])), vec![self.port_n(d)]),
+            25 => (format!("(let* ([k (min 5000 $0)] [s $1] [bf (make-bytes k 46)] [n ({av} bf s #f {p})] [m (if (and (exact-integer? n) (< n k)) (peek-bytes! bf (+ s n) {p} n k) 0)]) (if (or (eof-object? n) (and (eqv? n 0) (eof-object? m))) eof (subbytes bf 0 (+ n (if (exact-integer? m) m 0)))))", av = self.rng.pick(&["peek-bytes-avail!", "peek-bytes-avail!*"])), vec![self.port_n(d), self.port_n(d)]),
+            // events (racket/port)
+            26 => {
+                // (racket/port name, template, kids: n = a count, s = a skip, r = a regexp)
+                let (f, t, ks): (&str, &str, &str) = *self.rng.pick(&[
+                    ("read-bytes-evt", "$0 P", "n"), ("peek-bytes-evt", "$0 $1 #f P", "ns"),
+                    ("read-string-evt", "$0 P", "n"), ("read-char-evt", "P", ""), ("read-line-evt", "P 'any", ""),
+                    ("read-bytes-line-evt", "P 'linefeed", ""), ("regexp-match-evt", "$0 P", "r"),
+                    ("peek-string-evt", "$0 $1 #f P", "ns")]);
+                let mut kids = vec![];
+                for c in ks.chars() {
+                    kids.push(if c == 'r' { self.lib_lit(PORT_RX_POOL) } else { self.port_n(d) });
+                }
+                (format!("(sync/timeout 5 ((dynamic-require 'racket/port '{f}) {}))", t.replace("P", p)), kids)
+            }
+            27 => (format!("(eq? (sync/timeout 5 {p}) {p})"), vec![]),
+            28 => { let f = *self.rng.pick(&["port->bytes", "port->string", "port->lines", "port->bytes-lines"]); (format!("((dynamic-require 'racket/port '{f}) {p})"), vec![]) }
+            29 => (format!("(let ([o (open-output-bytes)]) ((dynamic-require 'racket/port 'copy-port) {p} o) (get-output-bytes o))"), vec![]),
+            30 => (format!("(begin (port-count-lines! {p}) 'counting)"), vec![]),
+            31 => (format!("(let ([q ((dynamic-require 'racket/port 'make-limited-input-port) {p} $0 #f)]) (list (read-bytes 3 q) (read-char q) (file-position q)))"), vec![self.port_n(d)]),
+            _ => (format!("(begin (close-input-port {p}) (port-closed? {p}))"), vec![]),
+        };
+        E::node(Ty::Val, "port-in", &tpl, kids).using(&[p])
+    }
+    /// An input port read by a few operations; their results as a list.
+    fn port_in(&mut self, d: usize) -> E {
+        let p = self.fresh("p");
+        let (open, src) = if self.rng.chance(0.75) {
+            ("open-input-bytes", self.port_data(d))
+        } else {
+            ("open-input-string", self.lib_str(d))
+        };
+        let count = if self.rng.chance(0.4) { format!("(port-count-lines! {p}) ") } else { String::new() };
+        let n = 1 + self.rng.below(6);
+        let mut kids = vec![src];
+        for _ in 0..n {
+            let op = self.port_in_op(&p, d);
+            kids.push(op);
+        }
+        let ops = (1..=n).map(|k| format!("${k}")).collect::<Vec<_>>().join(" ");
+        E::node(Ty::Val, "port-in", &format!("(let ([{p} ({open} $0)]) {count}(list {ops}))"), kids).binding(&[&p])
+    }
+    /// One operation on output port `o`; `seek` allows setting the position.
+    fn port_out_op(&mut self, o: &String, get: &str, seek: bool, d: usize) -> E {
+        let (tpl, kids): (String, Vec<E>) = match self.rng.below(if seek { 16 } else { 14 }) {
+            0 | 1 => (format!("(write-bytes $0 {o})"), vec![self.port_data(d)]),
+            2 => (format!("(let ([bs $0]) (write-bytes bs {o} (min $1 (bytes-length bs))))"), vec![self.port_data(d), self.port_n(d)]),
+            3 | 4 => (format!("(write-string $0 {o})"), vec![self.lib_str(d)]),
+            5 => (format!("(write-char $0 {o})"), vec![self.lib_char(d)]),
+            6 => (format!("(write-byte (modulo $0 256) {o})"), vec![self.lib_int(d)]),
+            7 => { let op = *self.rng.pick(&["display", "write", "print"]); (format!("({op} $0 {o})"), vec![self.lib_any(d)]) }
+            8 => (format!("(fprintf {o} \"~a|~s~n\" $0 $1)"), vec![self.lib_any(d), self.lib_any(d)]),
+            9 => (format!("(begin (newline {o}) (flush-output {o}) 'nl)"), vec![]),
+            10 => (format!("({get} {o})"), vec![]),
+            11 => (format!("(file-position {o})"), vec![]),
+            12 => (format!("(call-with-values (lambda () (port-next-location {o})) list)"), vec![]),
+            13 => (format!("(write-bytes (make-bytes $0 98) {o})"), vec![self.port_n(d)]),
+            _ => (format!("(begin (file-position {o} $0) (write-bytes $1 {o}))"), vec![self.port_n(d), self.port_data(d)]),
+        };
+        E::node(Ty::Val, "port-out", &tpl, kids).using(&[o])
+    }
+    fn port_out(&mut self, d: usize) -> E {
+        let o = self.fresh("o");
+        let (open, get) = if self.rng.chance(0.7) { ("open-output-bytes", "get-output-bytes") } else { ("open-output-string", "get-output-string") };
+        let seek = open == "open-output-bytes" && self.rng.chance(0.2);
+        let count = if self.rng.chance(0.4) { format!("(port-count-lines! {o}) ") } else { String::new() };
+        let n = 1 + self.rng.below(6);
+        let mut kids = vec![];
+        for _ in 0..n {
+            let op = self.port_out_op(&o, get, seek, d);
+            kids.push(op);
+        }
+        let ops = (0..n).map(|k| format!("${k}")).collect::<Vec<_>>().join(" ");
+        let tail = if self.rng.chance(0.5) { format!(" (file-position {o})") } else { String::new() };
+        E::node(Ty::Val, "port-out", &format!("(let ([{o} ({open})]) {count}(list {ops} ({get} {o}){tail}))"), kids).binding(&[&o])
+    }
+
     pub fn lib_op(&mut self, d: usize) -> E {
         let d = d.max(1);
-        match self.rng.below(10) {
+        match self.rng.below(12) {
             0..=3 => self.lib_numop(d - 1),
             4..=7 => self.lib_strop(d - 1),
+            10 => self.port_in(d - 1),
+            11 => self.port_out(d - 1),
             _ => self.lib_collop(d - 1),
         }
     }

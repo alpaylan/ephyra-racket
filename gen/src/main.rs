@@ -132,7 +132,7 @@ const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big
                             "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit", "ref93",
                             "local", "localpart", "localzo", "preempt", "preemptctl", "preemptsplit",
                             "common", "noclos", "notrap", "dbg", "noinl", "chezmix", "chezmixzo",
-                            "future", "futurezo", "futuresplit", "gcfuture"];
+                            "future", "futurezo", "futuresplit", "gcfuture", "port", "portsplit"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -172,7 +172,12 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 "future", "future", "future", "futurezo", "futurezo", "futurezo",
                                 "futurezo", "futurezo", "futurezo", "futuresplit", "futuresplit",
                                 "futuresplit", "futuresplit", "futuresplit", "futuresplit", "futuresplit",
-                                "futuresplit", "gcfuture", "gcfuture", "gcfuture"];
+                                "futuresplit", "gcfuture", "gcfuture", "gcfuture",
+                                // steering round 12: ports of other kinds with the same content
+                                // (only for programs with ports; others fall back to opaque)
+                                "port", "port", "port", "port", "port", "port", "port", "port", "port",
+                                "port", "port", "port", "portsplit", "portsplit", "portsplit", "portsplit",
+                                "portsplit", "portsplit"];
 
 /// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
 /// in 9.3: a case using one is not sent to the 9.3 server.
@@ -229,6 +234,18 @@ impl Pair {
             return Res::Died(Self::death(s));
         }
         match s.rx.recv_timeout(limit) {
+            Ok(l) if !matches!(kind_of(&l), "ok" | "exn" | "raise" | "timeout" | "oom") => {
+                // not a result line: something wrote to the server's stdout
+                // directly (Racket CS's thread-layer `internal-error` prints
+                // "internal-error: ..." and a " at <name>" backtrace with
+                // Chez's printf, then exits 1)
+                let mut more = vec![l];
+                while let Ok(x) = s.rx.recv_timeout(Duration::from_millis(1500)) {
+                    if more.len() < 40 { more.push(x); }
+                }
+                let _ = s.child.kill();
+                Res::Died(format!("stray output on stdout: {}; {}", more.join(" | "), Self::death(s)))
+            }
             Ok(l) => Res::Line(l),
             Err(RecvTimeoutError::Timeout) => Res::Hung,
             Err(RecvTimeoutError::Disconnected) => Res::Died(Self::death(s)),
@@ -578,7 +595,7 @@ const PRIORITY: &[&str] = &[
     "letrec-loop", "fl-loop", "for-fold", "for-sum", "values", "struct-mutate", "struct",
     "vector-mutate", "vector", "flvector", "hash", "type-dispatch", "type-guard", "pair-guard",
     "case-any", "box", "vector-any", "list-op", "if-mixed", "char", "symbol", "type-pred", "equal", "pair", 
-    "lib-hash", "lib-regexp", "lib-print", "lib-numstr", "lib-bytes", "lib-symbol", "lib-char", "lib-string", "lib-list", "lib-cmp", "lib-num", "lib-typed",
+    "port-in", "port-out", "lib-hash", "lib-regexp", "lib-print", "lib-numstr", "lib-bytes", "lib-symbol", "lib-char", "lib-string", "lib-list", "lib-cmp", "lib-num", "lib-typed",
     "flbit-field", "flround", "flmin-max", "fl->int",
     "int->fl", "fixnum-shift", "fixnum", "shift", "flonum", "generic-fl", "fl-compare", "fx-compare",
     "case", "cond", "if", "set", "lambda-app", "internal-define", "let", "call", "tap", "list",
@@ -689,22 +706,34 @@ fi
 if [ "$VAR" = jitify ]; then
   c=$(env -u PLT_CS_INTERP PLT_CS_COMPILE_LIMIT=10 RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt none 2>&1); cc=$?
 else
-  c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
+  # a process that hit the thread layer's internal-error spins instead of
+  # exiting (even on SIGTERM), so died cases get a shorter limit
+  T0=180; [ "$KIND" = died ] && T0=45
+  c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 $T0 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
 fi
 rc=$(res "$c")
 # preempt*/future*: where the timer fires during compilation (or whether a
 # future worker picks a future up before the touch) depends on timing, so
 # a run that matches is retried twice (the program's own sites are
 # deterministic in ticks, the expander/compiler's swaps are not)
+# died (e.g. the thread layer's "internal-error: attempting to suspend a
+# future in uninterruptible mode", which depends on a future running on a
+# worker at that moment): up to 8 more runs until one dies
 case "$VAR" in preempt*|future*|gcfuture)
-  for t in 1 2; do
-    [ "$KIND" != died ] && [ "$KIND" != hang ] && [ -n "$rc" ] && [ "$ra" = "$rc" ] || break
-    c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 180 "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
+  n=2; T=180; [ "$KIND" = died ] && n=8 && T=45
+  for t in $(seq $n); do
+    if [ "$KIND" = died ]; then
+      [ -n "$rc" ] || break
+    else
+      [ "$KIND" != hang ] && [ -n "$rc" ] && [ "$ra" = "$rc" ] || break
+    fi
+    c=$(env -u PLT_CS_INTERP -u PLT_CS_COMPILE_LIMIT RKT_CASE_TIMEOUT=60 timeout -k 5 $T "$R" runner.rkt file prog.rkt "$VAR" 2>&1); cc=$?
     rc=$(res "$c")
   done ;;
 esac
 case $KIND in
   died)
+    if printf '%s\n' "$c" | grep -q '^internal-error: '; then exit 1; fi
     if [ "$cc" != 0 ] && [ "$cc" != 124 ] && [ "$cc" != 137 ] && [ -z "$rc" ]; then exit 1; fi
     exit 0 ;;
   internal)
@@ -962,7 +991,12 @@ fn main() {
                     let Some(input) = run.draw() else { continue };
                     let iter = input.iteration();
                     // one variant per drawn case; unchanged while it is shrunk
-                    variant.set(VARIANT_DRAW[(mix(seed, 7_000_000 + cases) % VARIANT_DRAW.len() as u64) as usize]);
+                    let mut v = VARIANT_DRAW[(mix(seed, 7_000_000 + cases) % VARIANT_DRAW.len() as u64) as usize];
+                    // port variants only change programs with string/bytes ports
+                    if v.starts_with("port") && !render_program(&input.value.0).contains("(open-") {
+                        v = "opaque";
+                    }
+                    variant.set(v);
                     let tested = run.test(&input);
                     cases += 1;
                     let l = last.borrow_mut().take();

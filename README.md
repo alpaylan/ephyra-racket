@@ -356,6 +356,41 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      Racket thread; re-entering a `call/cc` continuation captured in the inner future from the outer
      future's thunk hangs the process (does not even react to SIGTERM) or raises "touch: future
      previously aborted" (all three seen on trunk and 9.3). About 1/7 of the draws. `macrodump prog.rkt future` prints the rewrite.
+   - `port`, `portsplit` (metamorphic, steering round 12; runner.rkt `port-module`,
+     `port-alt-forms`): every `open-input-bytes`, `open-input-string`, `open-output-bytes`,
+     `open-output-string`, `get-output-bytes`, `get-output-string` of the program is renamed to a
+     `pa:` version (defined at the end of the prelude) that returns a port of another kind with the
+     same content, the kind per call from a vector chosen from the program text (for a third of the
+     programs only 3 kinds). Input kinds: the bytes port itself; `make-input-port` without a peek
+     procedure (peek emulated by the port layer) and with one, delivering chunks of 1/2/3/5/7/4096/
+     all bytes; `make-input-port/read-to-peek`; a pre-filled closed pipe; an unlimited pipe fed piece
+     by piece by a thread (with and without `(sleep 0)` between pieces, so reads block on the writer);
+     `input-port-append` of pieces (some empty); `peeking-input-port`; `make-limited-input-port` over
+     the data plus a tail; `reencode-input-port` UTF-8→UTF-8 (valid UTF-8 only); a temp file
+     (opened, then deleted). Output kinds: bytes port, `make-output-port` accepting 1-4096 bytes
+     per call into a bytes port, a pipe drained by the getter, a temp file (read back through a
+     second port); when the program sets an output position (`(file-position o k)`) only the
+     seekable ones (bytes, file). Expected (reference ports.scrbl, custom-ports.scrbl,
+     pipes.scrbl, port-buffers.scrbl): blocking reads/peeks return the same bytes whatever the
+     chunking; "Calling file-position without a position on a port other than a file-stream port or
+     string port returns the number of bytes that have been read from that port"; locations are
+     counted from the bytes; get-output-string is "(bytes->string/utf-8 (get-output-bytes out)
+     #\uFFFD)". Not used: limited pipes (a blocking peek beyond the limit waits forever; the doc
+     only extends capacity by bytes actually peeked — checked on trunk and 9.3), avail/non-blocking
+     reads (counts may differ legitimately), `get-output-bytes` with reset (custom ports keep their
+     own position). `portsplit` = split + zo round trip. Port names are all `'string`, so messages
+     agree. `RKT_PORT_KIND=k` / `RKT_PORT_OKIND=k` force one kind (triage), `RKT_PORT_DEBUG=1`
+     prints the number of ports made. Programs without `(open-` run `opaque` instead.
+     The generator got port constructs (gen.rs `port_in`, `port_out`, 1/6 of `lib_op`): an input
+     port on tricky data (line endings, readable data, UTF-8 and invalid bytes, data across the
+     4096-byte buffer) read by 1-6 operations whose results form a list — `read-byte`/`char`,
+     `peek-byte`/`char` with skip, `read`/`peek-bytes`/`string` with counts and skips (also around
+     4096), `read-line`/`read-bytes-line` in all modes, regexp matching on ports (consuming, peeking,
+     try, with start offsets, lookbehind), `read`, `read-syntax` with srclocs, `file-position`,
+     `port-next-location` (with `port-count-lines!` for 40%), `read-bytes!`/`peek-bytes!`, the rest;
+     and an output port written by 1-6 operations (bytes with ranges, strings, chars, bytes,
+     `display`/`write`/`print`, `fprintf`, newline + flush, mid-way gets, positions, locations, big
+     writes, position sets followed by a write). Area tags `port-in`, `port-out`.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 
