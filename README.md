@@ -353,7 +353,9 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `call/cc`, `call-with-composable-continuation` or `current-continuation-marks` for a prompt
      installed inside the outer future's thunk fails ~50% of runs with "no corresponding prompt in
      the continuation", and an abort to the default tag from the inner future kills the whole
-     Racket thread. About 1/7 of the draws. `macrodump prog.rkt future` prints the rewrite.
+     Racket thread; re-entering a `call/cc` continuation captured in the inner future from the outer
+     future's thunk hangs the process (does not even react to SIGTERM) or raises "touch: future
+     previously aborted" (all three seen on trunk and 9.3). About 1/7 of the draws. `macrodump prog.rkt future` prints the rewrite.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 
@@ -415,3 +417,7 @@ variants gave no differences; the search found 6 `*__internal__*` findings (chez
 common), all the same Chez crash: with `$enable-check-prelex-flags` on, `compile-to-port` of
 `(lambda (t) (real->flonum (+ 5 (length t))))` (also `(inexact (if (fixnum? t) (+ t 1) 1))`)
 dies with "invalid memory reference"; it needs cptypes (`enable-type-recovery #f` avoids it).
+
+Round 11 check (same kind of build, 4 x 360 s, 6 669 cases): 4 failures (0.06%), all
+future variants, all nested-future continuation failures (futuresplit reentry/composable, futurezo
+composable/reentry); 500 sampled programs x 4 future variants gave 2 programs differing (both nested).
