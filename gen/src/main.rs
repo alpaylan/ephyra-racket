@@ -132,7 +132,8 @@ const VARIANTS: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp0big
                             "opaque", "opaquesplit", "ctlnoise", "ctlsplit", "gc", "gczo", "gcsplit", "ref93",
                             "local", "localpart", "localzo", "preempt", "preemptctl", "preemptsplit",
                             "common", "noclos", "notrap", "dbg", "noinl", "chezmix", "chezmixzo",
-                            "future", "futurezo", "futuresplit", "gcfuture", "port", "portsplit"];
+                            "future", "futurezo", "futuresplit", "gcfuture", "port", "portsplit",
+                            "top", "topzo", "topsplit", "rtrip", "rtripzo"];
 /// Draw table: the split variants (module split in two, cross-module
 /// inlining; runner.rkt `split-module`) and the macro variants (the module
 /// rewritten through hygienic macros, runner.rkt `macro-module`; steering
@@ -177,7 +178,17 @@ const VARIANT_DRAW: &[&str] = &["unsafe", "nocp0", "notr", "ctx", "noconst", "cp
                                 // (only for programs with ports; others fall back to opaque)
                                 "port", "port", "port", "port", "port", "port", "port", "port", "port",
                                 "port", "port", "port", "portsplit", "portsplit", "portsplit", "portsplit",
-                                "portsplit", "portsplit"];
+                                "portsplit", "portsplit",
+                                // steering round 13: forms evaluated one by one at the top level
+                                "top", "top", "top", "top", "top", "top", "top", "top", "top", "top",
+                                "top", "top", "topzo", "topzo", "topzo", "topzo", "topzo", "topzo",
+                                "topzo", "topzo", "topzo", "topzo", "topsplit", "topsplit", "topsplit",
+                                "topsplit", "topsplit", "topsplit", "topsplit", "topsplit", "topsplit",
+                                "topsplit",
+                                // steering round 13: write/read, fasl, number->string and
+                                // equal-hash-code round trips checked at the opaque sites
+                                "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip", "rtrip",
+                                "rtripzo", "rtripzo", "rtripzo", "rtripzo", "rtripzo", "rtripzo"];
 
 /// Names bound in trunk's racket/base, racket/fixnum or racket/flonum but not
 /// in 9.3: a case using one is not sent to the 9.3 server.

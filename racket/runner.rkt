@@ -13,7 +13,7 @@
 ;;   raise   <output> <written raised value>
 ;;   timeout <output>
 ;;   oom
-(require racket/port racket/fixnum racket/flonum racket/unsafe/ops racket/list
+(require racket/fasl racket/port racket/fixnum racket/flonum racket/unsafe/ops racket/list
          racket/string racket/pretty ffi/unsafe/vm racket/place racket/future)
 
 ;; Optimizer variants (third oracle, README.md "Variants"): the same module
@@ -90,7 +90,8 @@
                    "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"
                    "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"
                    "common" "noclos" "notrap" "dbg" "noinl" "chezmix" "chezmixzo"
-                   "future" "futurezo" "futuresplit" "gcfuture" "port" "portsplit"))
+                   "future" "futurezo" "futuresplit" "gcfuture" "port" "portsplit"
+                   "top" "topzo" "topsplit" "rtrip" "rtripzo"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -523,6 +524,7 @@
   (define (literal? e) (or (number? e) (boolean? e) (char? e) (string? e)
                            (and (pair? e) (eq? (car e) 'quote))))
   (define (opq e) (cond [(eq? ctl? 'gc) `(gc-v ,e)]
+                        [(eq? ctl? 'rt) `(rt-v ,e)]
                         [(eq? ctl? 'pre) `(pre-v ,e)]
                         [(eq? ctl? 'fut) `(fut-v (lambda () ,e))]
                         [(eq? ctl? 'prectl) (if (pick 3) (ctl-wrap e rng) `(pre-v ,e))]
@@ -617,6 +619,98 @@
   (define rng (macro-rng (string-append (if ctl? "ctl" "opaque") src)))
   `(module m ,lang ,@pre ,@(if ctl? ctl-defs opaque-defs)
      ,@(opaque-rewrite-items items (cdddr form) rng ctl?)))
+
+;; ---------------------------------------------------------------------
+;; Round trips at run time (variants rtrip, rtripzo; steering round 13).
+;; The opaque sites are wrapped in `(rt-v e)`, which returns e's value v
+;; unchanged after checking documented round trips on it:
+;;  - write then read: reference/printer.scrbl, "write mode prints core
+;;    datatypes in such a way that using read on the output produces a
+;;    value that is equal? to the printed value" (only for trees of numbers,
+;;    strings, byte strings, chars, interned symbols, keywords, booleans,
+;;    '(), pairs and vectors);
+;;  - s-exp->fasl / fasl->s-exp with #:keep-mutable? #t (also boxes and hash
+;;    tables): the result must be equal? to v (reference/fasl.scrbl: the
+;;    defaults "behave like the composition of write and read");
+;;  - number->string / string->number in radix 10 (and 2/8/16 for exact
+;;    numbers): eqv? (reference/numbers.scrbl, the printer's number syntax);
+;;  - equal-hash-code of v and of each equal? copy are the same
+;;    (equality.scrbl: "For any two calls with equal? values, the returned
+;;    number is the same"), eqv-hash-code too for numbers; an immutable hash
+;;    rebuilt in another insertion order must be equal? with the same code.
+;; A violation raises `internal error: round trip ...` (kind internal).
+;; Values whose written form is over 20000 chars, and calls after the
+;; 3000th per case, are not checked.
+(define rt-defs
+  '((require (only-in racket/fasl s-exp->fasl fasl->s-exp))
+    (define rt-n 0)
+    (define (rt-readable? v d)
+      (and (< d 200)
+           (cond [(or (number? v) (string? v) (bytes? v) (char? v) (keyword? v)
+                      (boolean? v) (null? v)) #t]
+                 [(symbol? v) (symbol-interned? v)]
+                 [(pair? v) (and (rt-readable? (car v) (add1 d)) (rt-readable? (cdr v) (add1 d)))]
+                 [(vector? v) (for/and ([x (in-vector v)]) (rt-readable? x (add1 d)))]
+                 [else #f])))
+    (define (rt-atomic-key? k eq?-table)
+      (or (fixnum? k) (char? k) (boolean? k) (null? k) (keyword? k)
+          (and (symbol? k) (symbol-interned? k))
+          (and (number? k) (not eq?-table))))
+    (define (rt-faslable? v d)
+      (and (< d 200)
+           (cond [(rt-readable? v d) #t]
+                 [(box? v) (rt-faslable? (unbox v) (add1 d))]
+                 [(pair? v) (and (rt-faslable? (car v) (add1 d)) (rt-faslable? (cdr v) (add1 d)))]
+                 [(vector? v) (for/and ([x (in-vector v)]) (rt-faslable? x (add1 d)))]
+                 ;; a copy's keys are new objects: in an eq?/eqv?/equal-always?
+                 ;; table they must be keys whose identity a copy keeps
+                 [(hash? v) (and (not (hash-weak? v)) (not (hash-ephemeron? v))
+                                 (for/and ([(k x) (in-hash v)])
+                                   (and (rt-faslable? k (add1 d)) (rt-faslable? x (add1 d))
+                                        (or (hash-equal? v) (rt-atomic-key? k (hash-eq? v))))))]
+                 [else #f])))
+    (define (rt-fail what v w)
+      (error 'rt-v "internal error: round trip ~a: ~.s -> ~.s" what v w))
+    (define (rt-same-hash what v w)
+      (unless (= (equal-hash-code v) (equal-hash-code w))
+        (rt-fail (format "~a: equal-hash-code differs" what) v w))
+      (when (and (number? v) (not (= (eqv-hash-code v) (eqv-hash-code w))))
+        (rt-fail (format "~a: eqv-hash-code differs" what) v w)))
+    (define (rt-check v)
+      (define written (let ([o (open-output-string)]) (write v o) (get-output-string o)))
+      (when (< (string-length written) 20000)
+        (when (rt-readable? v 0)
+          (define w (with-handlers ([exn:fail? (lambda (e) (rt-fail (format "write/read raised ~s" (exn-message e)) v written))])
+                      (parameterize ([read-decimal-as-inexact #t] [read-accept-reader #f])
+                        (read (open-input-string written)))))
+          (unless (equal? v w) (rt-fail "write/read" v w))
+          (rt-same-hash "write/read" v w))
+        (when (number? v)
+          (for ([r (if (exact? v) '(10 2 8 16) '(10))])
+            (define s (number->string v r))
+            (define w (string->number s r))
+            (unless (eqv? v w) (rt-fail (format "number->string/string->number radix ~a" r) v s))))
+        (when (rt-faslable? v 0)
+          (define w (with-handlers ([exn:fail? (lambda (e) (rt-fail (format "fasl raised ~s" (exn-message e)) v #f))])
+                      (fasl->s-exp (s-exp->fasl v #:keep-mutable? #t))))
+          (unless (equal? v w) (rt-fail "fasl" v w))
+          (rt-same-hash "fasl" v w))
+        (when (and (hash? v) (immutable? v) (rt-faslable? v 0))
+          (define w (for/fold ([h (hash-copy-clear v)]) ([kv (reverse (hash->list v))])
+                      (hash-set h (car kv) (cdr kv))))
+          (unless (equal? v w) (rt-fail "hash rebuilt in another order" v w))
+          (rt-same-hash "hash rebuilt in another order" v w))))
+    (define (rt-v v)
+      (set! rt-n (add1 rt-n))
+      (when (< rt-n 3000) (rt-check v))
+      v)))
+
+(define (rt-module form src)
+  (define lang (caddr form))
+  (define-values (pre items) (split-prelude (cdddr form)))
+  (define rng (macro-rng (string-append "rt" src)))
+  `(module m ,lang ,@pre ,@rt-defs
+     ,@(opaque-rewrite-items items (cdddr form) rng 'rt)))
 
 ;; ---------------------------------------------------------------------
 ;; GC stress (variants gc, gczo, gcsplit; steering round 6).  Garbage
@@ -973,6 +1067,84 @@
      (define (local-print% . vs) (for-each (current-print) vs))
      ,@keep ,@wrapped))
 
+;; Metamorphic top-level evaluation (variants top, topzo, topsplit; steering
+;; round 13).  The module's body forms are evaluated one by one at the top
+;; level of the fresh racket/base namespace instead: every form becomes its
+;; own top-level linklet (expander compile/top.rkt, eval/top.rkt), module
+;; definitions become namespace (top-level) variables that schemify knows
+;; nothing about across forms (no constants, no known procedures, no
+;; cross-form inlining; calls through variable references), `require`s and
+;; the `show` macro are handled by the top-level expander.  A module body
+;; prints its expression forms' values with `current-print` and wraps each in
+;; a default-tag prompt (reference/syntax.scrbl `module`); `eval` at the top
+;; level does neither, so each expression item e becomes
+;;   (call-with-values (lambda () (call-with-continuation-prompt (lambda () e)))
+;;                     top-print%)
+;; Generated names are unique and only refer to earlier definitions
+;; (valid_program), so no forward reference or redefinition exists and
+;; the top level's documented differences (reference/eval-model.scrbl, the
+;; top level is "hopeless" only for those) do not apply.  For a third of the
+;; programs the opaque rewrite is applied first (a sixth: ctlnoise).  topzo: each form compiled,
+;; written, read back and evaluated (per form), or for half of the programs
+;; the prelude per form and then all generated items as one `(begin ...)`
+;; compiled at once (a compiled top-level sequence, its definitions declared
+;; but not yet run) and round-tripped.
+;; topsplit: the provider module `a` of split-module (zo round trip) is
+;; declared, then the client's body (its `(require 'a)` included) runs at
+;; the top level: top-level linklets importing a module's known bindings.
+(define (top-variant? v) (member v '("top" "topzo" "topsplit")))
+(define (top-body-forms mform [src #f])
+  ;; (module m lang . body) -> top-level forms
+  (define (decl? f) (and (pair? f) (memq (car f) '(define define-values define-syntax-rule
+                                                    define-syntax struct require provide))))
+  (define (fun-def? f) (and (pair? f) (eq? (car f) 'define) (pair? (cdr f)) (pair? (cadr f))))
+  (define fs
+    (for/list ([f (cdddr mform)])
+      (if (decl? f)
+          f
+          `(call-with-values
+            (lambda () (call-with-continuation-prompt (lambda () ,f)))
+            top-print%))))
+  ;; for half of the programs (given src), function definitions are
+  ;; evaluated a second time, unchanged, at a later position: the top level
+  ;; allows redefinition, and a `define` of a lambda has no other effect, so
+  ;; callers compiled before (or in the same compiled begin) must see an
+  ;; equivalent procedure (no stale known-procedure/inlining assumptions)
+  (define rng (and src (macro-rng (string-append "topredef" src))))
+  (define fs*
+    (if (and rng (zero? (rng 2)))
+        (let* ([n (length fs)]
+               [v (list->vector (map list fs))])
+          (for ([f fs] [i (in-naturals)] #:when (and (fun-def? f) (zero? (rng 2))))
+            (define j (+ i (rng (- n i))))
+            (vector-set! v j (append (vector-ref v j) (list f))))
+          (apply append (vector->list v)))
+        fs))
+  (cons '(define (top-print% . vs) (for-each (current-print) vs)) fs*))
+(define (top-base form src)
+  (case ((macro-rng (string-append "topopq" src)) 6)
+    [(0 1) (opaque-module form src)]
+    [(2) (opaque-module form src #t)]   ; ctlnoise wrappers
+    [else form]))
+(define (run-top variant form src)
+  (define rng (macro-rng (string-append "top" variant src)))
+  (case variant
+    [("top") (for ([f (top-body-forms (top-base form src) src)]) (eval f))]
+    [("topzo")
+     (define fs (top-body-forms (top-base form src) src))
+     (if (zero? (rng 2))
+         (for ([f fs]) (eval (zo-round-trip (compile f))))
+         ;; `compile` of a top-level begin does not run the `show` macro's
+         ;; definition, so the prelude (up to `show`) goes first, per form
+         (let-values ([(pre items) (split-prelude fs)])
+           (for ([f pre]) (eval (zo-round-trip (compile f))))
+           (eval (zo-round-trip (compile `(begin ,@items))))))]
+    [("topsplit")
+     (define ms (split-module (top-base form src)))
+     (eval (zo-round-trip (compile (car ms))))
+     (for ([f (top-body-forms (cadr ms) src)])
+       (if (zero? (rng 2)) (eval f) (eval (zo-round-trip (compile f)))))]))
+
 ;; Metamorphic port variants (steering round 12): every string/bytes port
 ;; of the program is replaced by a port of another kind with the same
 ;; content (definitions in `port-alt-forms`, kinds per call from a vector
@@ -1291,7 +1463,7 @@
 
 (define (fresh-ns)
   (define ns (make-base-namespace))
-  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list ffi/unsafe/vm racket/future racket/port)])
+  (for ([m '(racket/fixnum racket/flonum racket/unsafe/ops racket/list ffi/unsafe/vm racket/future racket/port racket/fasl)])
     (namespace-attach-module orig-ns m ns))
   ns)
 
@@ -1398,8 +1570,11 @@
                      [("chezmix") (for ([f (chezmix-forms form src)]) (eval f))]
                      [("chezmixzo")
                       (for ([f (chezmix-forms form src)]) (eval (zo-round-trip (compile f))))]
+                     [("top" "topzo" "topsplit") (run-top variant form src)]
+                     [("rtrip") (eval (rt-module form src))]
+                     [("rtripzo") (eval (zo-round-trip (compile (rt-module form src))))]
                      [else (eval form)])
-                   (dynamic-require ''m #f)
+                   (unless (top-variant? variant) (dynamic-require ''m #f))
                    (when (and (equal? variant "port") (getenv "RKT_PORT_DEBUG"))
                      (eprintf "ports made: ~a\n" (eval 'pa:n (module->namespace ''m))))
                    (when (equal? variant "macrosub")
@@ -1508,6 +1683,10 @@
                 [("gcfuture") (list (future-module form src #t))]
                 [("port") (list (port-module form src))]
                 [("portsplit") (split-module (port-module form src))]
+                [("rtrip" "rtripzo") (list (rt-module form src))]
+                [("top" "topzo") (top-body-forms (top-base form src) src)]
+                [("topsplit") (let ([ms (split-module (top-base form src))])
+                                (cons (car ms) (top-body-forms (cadr ms) src)))]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])

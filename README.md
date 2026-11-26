@@ -404,6 +404,49 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      now any line that is not a result line makes the server count as dead (`died`, the lines are
      in the message) and the server is killed; the variant repro retries a died future case up to
      8 times with a 45 s limit and accepts an `internal-error:` line as reproduction.
+   - `top`, `topzo`, `topsplit` (metamorphic, steering round 13; runner.rkt `run-top`,
+     `top-body-forms`): the module's body forms are evaluated one by one at the top level of the
+     fresh `racket/base` namespace instead of as a module. Each form is its own top-level linklet
+     (expander compile/top.rkt, eval/top.rkt; optimized, machine code), module definitions become
+     namespace variables that schemify knows nothing about across forms (no constants, no known
+     procedures or struct accessors, no cross-form inlining, every reference through a variable
+     instance), `require`, `struct` and the `show` macro go through the top-level expander. A module
+     body prints its expression forms' values with `current-print` and runs each in a default-tag
+     prompt (reference/syntax.scrbl `module`); top-level `eval` does neither, so each expression
+     item becomes `(call-with-values (lambda () (call-with-continuation-prompt (lambda () e)))
+     top-print%)`. Generated names are unique and refer only to earlier definitions, so no forward
+     reference or redefinition exists (the documented top-level differences, reference
+     eval-model.scrbl "top-level is hopeless", are about those). For a third of the programs the
+     opaque rewrite is applied first, for a sixth the ctlnoise one. `topzo`: per form `compile` + zo round trip + `eval`, or (half
+     of the programs) the prelude per form and then all generated items as one compiled top-level
+     `(begin ...)` (one compiled object holding several top-level linklets; `compile` of a begin
+     does not run a `define-syntax` of the same begin, hence the prelude first). `topsplit`: the
+     provider module `a` of `split-module` (zo round trip) is declared, then the client's body
+     including `(require 'a)` runs at the top level, per form plain or zo (top-level linklets
+     importing a module's known bindings). `macrodump prog.rkt top` prints the forms. About 1/7 of
+     the draws. First probe (300 programs x 3 on trunk): one difference, the known
+     unboxed-`fl+` composable-continuation bug (the module side is the wrong one).
+     For half of the programs every function definition `(define (f ...) ...)` is also evaluated
+     a second time, unchanged, at a later position (the top level allows redefinition, a lambda
+     definition has no other effect, so callers compiled earlier — or in the same compiled begin —
+     must see an equivalent procedure: no stale known-procedure or inlining assumptions).
+   - `rtrip`, `rtripzo` (run-time round trips, steering round 13; runner.rkt `rt-module`,
+     `rt-defs`): the opaque sites are wrapped in `(rt-v e)`, which returns e's value unchanged
+     after checking documented round trips on it: `write` then `read` gives an `equal?` value
+     (printer.scrbl: "write mode prints core datatypes in such a way that using read on the output
+     produces a value that is equal? to the printed value"; only trees of numbers, strings, byte
+     strings, chars, interned symbols, keywords, booleans, `'()`, pairs, vectors);
+     `s-exp->fasl`/`fasl->s-exp` with `#:keep-mutable? #t` (also boxes and hash tables; in
+     eq?/eqv?/equal-always? tables only keys whose identity a copy keeps: fixnums, chars, booleans,
+     symbols, keywords, and numbers for eqv?) gives an `equal?` value; `number->string` /
+     `string->number` (radix 10, and 2/8/16 for exact numbers) gives an `eqv?` number;
+     `equal-hash-code` (and `eqv-hash-code` for numbers) of v and of each copy agree
+     (equality.scrbl: "For any two calls with equal? values, the returned number is the same");
+     an immutable hash rebuilt in reverse insertion order is `equal?` with the same hash code. A
+     violation raises `rt-v: internal error: round trip <what>: <v> -> <copy>` (kind `internal`).
+     First 3000 sites per case, values written in under 20 000 chars. `rtripzo` = + zo round trip.
+     About 1/14 of the draws. Probes: 950 programs x 2 clean after restricting non-equal? table
+     keys (a copied mutable-string key is a new object for eqv?, correctly not `equal?`).
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 
