@@ -1044,7 +1044,9 @@
       (let loop ([ds (list (find-system-path 'temp-dir) (string->path "/tmp")
                            (current-directory))])
         (cond
-          [(null? ds) (find-system-path 'temp-dir)]
+          ;; none writable: #f, and the file kinds fall back to a bytes port
+          ;; (triage port-value-handlers: a missing TMPDIR)
+          [(null? ds) #f]
           [(with-handlers ([exn:fail? (lambda (e) #f)])
              (let ([p (build-path (car ds) (format "rktpa-probe-~a-~a" (current-inexact-milliseconds)
                                                    (eq-hash-code (box 0))))])
@@ -1143,9 +1145,9 @@
     [(9) (if (pa:valid-utf-8? b*)
              (reencode-input-port (open-input-bytes b*) "UTF-8" #f #f 'string)
              (pa:custom-in b* #t k))]
-    [(10) (let ([f (pa:tmp-path)])
+    [(10) (if (not (pa:find-tmp-dir)) (open-input-bytes b*) (let ([f (pa:tmp-path)])
             (call-with-output-file f (lambda (o) (write-bytes b* o)) #:exists 'truncate)
-            (begin0 (open-input-file f) (delete-file f)))]
+            (begin0 (open-input-file f) (delete-file f))))]
     [else (let-values ([(i o) (make-pipe #f 'string 'string)])
             ;; unlimited pipe filled by a thread, closed at the end
             (thread (lambda ()
@@ -1159,7 +1161,8 @@
 ;; output ports: a struct-free registry from port to its content getter
 (define pa:getters (make-weak-hasheq))
 (define (pa:open-output-bytes [name 'string])
-  (define k (if pa:seek? (vector-ref '#(0 3) (modulo (pa:next pa:okinds) 2)) (pa:next pa:okinds)))
+  (define k0 (if pa:seek? (vector-ref '#(0 3) (modulo (pa:next pa:okinds) 2)) (pa:next pa:okinds)))
+  (define k (if (and (= k0 3) (not (pa:find-tmp-dir))) 0 k0))
   (case k
     [(0) (open-output-bytes name)]
     [(1) (define inner (open-output-bytes))
