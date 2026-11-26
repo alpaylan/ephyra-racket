@@ -1038,10 +1038,12 @@
 ;; writable; in a sandbox /var/tmp can exist read-only (triage
 ;; port-error-letrec-loop: open-output-file failed on every file port).
 ;; Use the first candidate where a file can actually be created.
+;; (same cause: triage port__value__lib-print, TMPDIR unset in the search)
 (define pa:tmp-dir #f)
 (define (pa:find-tmp-dir)
   (or pa:tmp-dir
       (let loop ([ds (list (find-system-path 'temp-dir) (string->path "/tmp")
+                           (string->path "/dev/shm")
                            (current-directory))])
         (cond
           [(null? ds) (find-system-path 'temp-dir)]
