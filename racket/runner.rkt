@@ -496,7 +496,11 @@
   (define p-expr (vector-ref (if pre? #(2 3 12) #(6 12 40)) (rng 3)))  ; 1/k other subexpressions
   ;; preempt: also arm the timer at the start of 1/k function bodies
   (define p-entry (if pre? (vector-ref #(1 2 1000000) (rng 3)) 1000000))
-  (define (prologue bs) (if (pick p-entry) (cons '(pre-v (void)) bs) bs))
+  ;; only the preempt variants define `pre-v`; with p-entry = 1000000 the
+  ;; pick still fires about once per million bodies, so guard on pre? too
+  ;; (pick first: the rng stream, and so every other rewrite, is unchanged)
+  ;; (else gc/opaque/ctl variants failed with `pre-v: unbound identifier`)
+  (define (prologue bs) (if (and (pick p-entry) pre?) (cons '(pre-v (void)) bs) bs))
   (define p-user (vector-ref #(1 2 4) (rng 3)))    ; 1/k user callees
   (define p-prim (vector-ref #(1 2 4 1000000) (rng 4))) ; 1/k primitive callees
   (define (pick k) (zero? (rng k)))
