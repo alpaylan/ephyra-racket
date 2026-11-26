@@ -249,7 +249,8 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      sets), io — or is a documented change since 9.3. Comparison form (`norm93`, mirrored in
      the repro's python): error-message texts dropped (inside `show` output and the final exn
      line; struct type and `show`'s kind stay), and when the program uses min/max the sign of
-     zero is ignored (05afec9201 documents flmax's changed -0.0 result). Not compared: 9.3
+     zero is ignored (05afec9201 documents flmax's changed -0.0 result), and with flmax also
+     the sign of infinity (that zero reaches it through division). Not compared: 9.3
      crashes/hangs/internal errors (9.3's problems), programs using names 9.3 lacks
      (`NEW_SINCE_93`, e.g. `flhypot`; also any 9.3 unbound-identifier/syntax error), and
      differing programs that capture continuations (9.3 has the unboxed-flonum continuation

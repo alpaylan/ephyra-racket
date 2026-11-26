@@ -488,6 +488,12 @@ fn norm93(l: &str, prog: &str) -> String {
     if ["flmax", "flmin", "(max ", "(min "].iter().any(|p| prog.contains(p)) {
         s = s.replace("-0.0", "0.0");
     }
+    // The sign of that zero reaches printed infinities through division
+    // ((fl/ -1.0 (flmax 0.0 0.0 -0.0)): trunk +inf.0, 9.3 -inf.0), so with
+    // flmax the sign of infinity is ignored too.
+    if prog.contains("flmax") {
+        s = s.replace("-inf.0", "+inf.0");
+    }
     s
 }
 
@@ -759,6 +765,7 @@ def norm(l):
     if f[0] == "exn": f = f[:3]
     s = "\t".join(f)
     if any(p in prog for p in ("flmax", "flmin", "(max ", "(min ")): s = s.replace("-0.0", "0.0")
+    if "flmax" in prog: s = s.replace("-inf.0", "+inf.0")
     return s
 sys.exit(1 if norm(os.environ["RA"]) != norm(os.environ["RC"]) else 0)
 '
