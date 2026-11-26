@@ -90,7 +90,8 @@
                    "opaque" "opaquesplit" "ctlnoise" "ctlsplit" "gc" "gczo" "gcsplit"
                    "local" "localpart" "localzo" "preempt" "preemptctl" "preemptsplit"
                    "common" "noclos" "notrap" "dbg" "noinl" "chezmix" "chezmixzo"
-                   "future" "futurezo" "futuresplit" "gcfuture" "port" "portsplit"))
+                   "future" "futurezo" "futuresplit" "gcfuture" "port" "portsplit"
+                   "top" "topzo" "topsplit"))
 
 ;; Metamorphic split.  The program is `(module m racket/base <prelude>
 ;; <items>)`; the prelude ends with `(define-syntax-rule (show e) ...)`.
@@ -973,6 +974,66 @@
      (define (local-print% . vs) (for-each (current-print) vs))
      ,@keep ,@wrapped))
 
+;; Metamorphic top-level evaluation (variants top, topzo, topsplit; steering
+;; round 13).  The module's body forms are evaluated one by one at the top
+;; level of the fresh racket/base namespace instead: every form becomes its
+;; own top-level linklet (expander compile/top.rkt, eval/top.rkt), module
+;; definitions become namespace (top-level) variables that schemify knows
+;; nothing about across forms (no constants, no known procedures, no
+;; cross-form inlining; calls through variable references), `require`s and
+;; the `show` macro are handled by the top-level expander.  A module body
+;; prints its expression forms' values with `current-print` and wraps each in
+;; a default-tag prompt (reference/syntax.scrbl `module`); `eval` at the top
+;; level does neither, so each expression item e becomes
+;;   (call-with-values (lambda () (call-with-continuation-prompt (lambda () e)))
+;;                     top-print%)
+;; Generated names are unique and only refer to earlier definitions
+;; (valid_program), so no forward reference or redefinition exists and
+;; the top level's documented differences (reference/eval-model.scrbl, the
+;; top level is "hopeless" only for those) do not apply.  For a third of the
+;; programs the opaque rewrite is applied first.  topzo: each form compiled,
+;; written, read back and evaluated (per form), or for half of the programs
+;; the prelude per form and then all generated items as one `(begin ...)`
+;; compiled at once (a compiled top-level sequence, its definitions declared
+;; but not yet run) and round-tripped.
+;; topsplit: the provider module `a` of split-module (zo round trip) is
+;; declared, then the client's body (its `(require 'a)` included) runs at
+;; the top level: top-level linklets importing a module's known bindings.
+(define (top-variant? v) (member v '("top" "topzo" "topsplit")))
+(define (top-body-forms mform)
+  ;; (module m lang . body) -> top-level forms
+  (define (decl? f) (and (pair? f) (memq (car f) '(define define-values define-syntax-rule
+                                                    define-syntax struct require provide))))
+  (cons '(define (top-print% . vs) (for-each (current-print) vs))
+        (for/list ([f (cdddr mform)])
+          (if (decl? f)
+              f
+              `(call-with-values
+                (lambda () (call-with-continuation-prompt (lambda () ,f)))
+                top-print%)))))
+(define (top-base form src)
+  (if (zero? ((macro-rng (string-append "topopq" src)) 3))
+      (opaque-module form src)
+      form))
+(define (run-top variant form src)
+  (define rng (macro-rng (string-append "top" variant src)))
+  (case variant
+    [("top") (for ([f (top-body-forms (top-base form src))]) (eval f))]
+    [("topzo")
+     (define fs (top-body-forms (top-base form src)))
+     (if (zero? (rng 2))
+         (for ([f fs]) (eval (zo-round-trip (compile f))))
+         ;; `compile` of a top-level begin does not run the `show` macro's
+         ;; definition, so the prelude (up to `show`) goes first, per form
+         (let-values ([(pre items) (split-prelude fs)])
+           (for ([f pre]) (eval (zo-round-trip (compile f))))
+           (eval (zo-round-trip (compile `(begin ,@items))))))]
+    [("topsplit")
+     (define ms (split-module (top-base form src)))
+     (eval (zo-round-trip (compile (car ms))))
+     (for ([f (top-body-forms (cadr ms))])
+       (if (zero? (rng 2)) (eval f) (eval (zo-round-trip (compile f)))))]))
+
 ;; Metamorphic port variants (steering round 12): every string/bytes port
 ;; of the program is replaced by a port of another kind with the same
 ;; content (definitions in `port-alt-forms`, kinds per call from a vector
@@ -1371,8 +1432,9 @@
                      [("chezmix") (for ([f (chezmix-forms form src)]) (eval f))]
                      [("chezmixzo")
                       (for ([f (chezmix-forms form src)]) (eval (zo-round-trip (compile f))))]
+                     [("top" "topzo" "topsplit") (run-top variant form src)]
                      [else (eval form)])
-                   (dynamic-require ''m #f)
+                   (unless (top-variant? variant) (dynamic-require ''m #f))
                    (when (and (equal? variant "port") (getenv "RKT_PORT_DEBUG"))
                      (eprintf "ports made: ~a\n" (eval 'pa:n (module->namespace ''m))))
                    (when (equal? variant "macrosub")
@@ -1463,6 +1525,9 @@
                 [("gcfuture") (list (future-module form src #t))]
                 [("port") (list (port-module form src))]
                 [("portsplit") (split-module (port-module form src))]
+                [("top" "topzo") (top-body-forms (top-base form src))]
+                [("topsplit") (let ([ms (split-module (top-base form src))])
+                                (cons (car ms) (top-body-forms (cadr ms))))]
                 [else (list (macro-module form src))])])
        (pretty-write f real-out)))]
   [else (error 'runner "usage: runner.rkt server | file <prog> [variant]")])
