@@ -34,6 +34,29 @@ UNI = ['é', 'É', 'ñ', 'Ñ', 'ÿ', 'ß', 'λ', 'Λ', 'σ', 'Σ', 'α', 'ω', '
        '中', '文', '😀', '𝔸', '́', '²', '٣', '«', '»', '—', '€', '©', ' ',
        '­', 'ǅ', 'Ǆ', 'ǆ', 'ς', 'ê', 'Ê', 'ø', 'Ø', '　', '٫', '∑']
 UNI_NOFOLD = {'ς', 'ǅ', 'Ǆ', 'ǆ', 'σ', 'Σ'}   # never under (?i): fold classes differ by design
+# (Racket's own tests pin its choice: rx.rktl's sigma loop expects (?i:σ) and
+# (?i:Σ) not to match ς, while (?i:ς) matches all three; Python matches all
+# three either way.) That covers class ranges under (?i) too: [z-λ] contains Σ.
+UNI_NOFOLD_CODES = sorted(ord(c) for c in UNI_NOFOLD)
+
+
+def range_has_nofold(a, b):
+    return any(a <= c <= b for c in UNI_NOFOLD_CODES)
+
+
+def ci_nofold_range(n, ci=False):
+    """True if a class range under (?i) spans a UNI_NOFOLD character."""
+    t = n[0]
+    if t == 'mode':
+        return ci_nofold_range(n[2], True if n[1] == 'i' else False if n[1] == '-i' else ci)
+    if t == 'cls':
+        return ci and any(it[0] == 'r' and range_has_nofold(it[1], it[2]) for it in n[2])
+    if t in ('seq', 'alt'): return any(ci_nofold_range(x, ci) for x in n[1])
+    if t in ('grp', 'ncg', 'atomic'): return ci_nofold_range(n[1], ci)
+    if t == 'look': return ci_nofold_range(n[2], ci)
+    if t == 'rep': return ci_nofold_range(n[4], ci)
+    if t == 'cond': return any(ci_nofold_range(x, ci) for x in n[2:] if x)
+    return False
 BYTES_HI = [0x80, 0x9f, 0xa0, 0xc3, 0xce, 0xe9, 0xff, 0x00, 0x7f, 0x01]
 PROPS = ['Ll', 'Lu', 'Lt', 'L', 'Nd', 'No', 'N', 'P', 'Po', 'Pd', 'Pi', 'Pf', 'S', 'Sm',
          'Sc', 'So', 'Zs', 'Z', 'Mn', 'M', 'Cf', 'Cc', 'C', 'L&', 'Lo']
@@ -145,7 +168,7 @@ class Gen:
             if y < 0.45: items.append(['c', self.ch()])
             elif y < 0.75:
                 a, b = sorted([self.ch(), self.ch()])
-                if chr(a) in ']\\-^[' or chr(b) in ']\\-^[':
+                if chr(a) in ']\\-^[' or chr(b) in ']\\-^[' or (self.ci and range_has_nofold(a, b)):
                     items.append(['c', a]); items.append(['c', b])
                 else:
                     items.append(['r', a, b])
@@ -748,6 +771,7 @@ def check(text, line):
         if l:
             k, _, v = l.partition(' ')
             got[k] = v
+    nofold_skipped = 0
     for sp in specs:
         try:
             E = expected(sp)
@@ -758,6 +782,9 @@ def check(text, line):
                        got.get('%d.%s' % (sp['i'], op), '').startswith('err byte-pregexp') for op in sp['ops'])
         if rejected:
             continue  # Racket rejected a pattern Python accepts (counted as skip by caller via 'pass')
+        if sp['mode'] == 's' and ci_nofold_range(sp['ast']):
+            nofold_skipped += 1
+            continue  # see UNI_NOFOLD; the generator no longer emits these
         for op in sp['ops']:
             k = '%d.%s' % (sp['i'], op)
             g = got.get(k)
@@ -774,6 +801,8 @@ def check(text, line):
                 first[0], first[1][:300], first[2][:300], rkpat, pyp, to_text(sp['in'], sp['mode']), sp['st'], sp['en'],
                 bytes(sp['pre']), ','.join(bad))
             return ('fail', kind, sp['i'], area(sp, bad), det)
+    if specs and nofold_skipped == len(specs):
+        return ('skip', 'casei-nofold-range')
     return ('pass',)
 
 
