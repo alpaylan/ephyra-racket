@@ -3,7 +3,8 @@
 A harness that generates well-formed Racket modules and checks that Racket CS gives the same
 result when the same module is run in ways that must agree: machine code vs. the interpreter
 (`PLT_CS_INTERP=1`), optimizer toggles, `.zo` round trips, splitting a module into two (cross-module
-inlining), rewriting it through hygienic macros, GC stress, and more. Programs are generated and shrunk
+inlining), rewriting it through hygienic macros, GC stress, thread preemption, and the released
+Racket 9.3 as a second reference. Programs are generated and shrunk
 with [Ephyra](https://github.com/datadog-labs/ephyra), a property-based testing library for Rust.
 
 The generator and oracles were written by an automated agent loop driving Ephyra, seeded with the
@@ -11,17 +12,24 @@ oracle ideas of [racket-fuzz](https://github.com/samth/racket-fuzz) (no code is 
 
 ## Bugs found
 
-- [racket/racket#5688](https://github.com/racket/racket/issues/5688): schemify: inlined function loses
-  `set!` of a `let`-bound copy of its argument
-- [racket/racket#5689](https://github.com/racket/racket/issues/5689): schemify: cross-module inlining
-  loses `set!` of the inlined function's argument
+- [racket/racket#5688](https://github.com/racket/racket/issues/5688) (fixed): schemify: inlined
+  function loses `set!` of a `let`-bound copy of its argument
+- [racket/racket#5689](https://github.com/racket/racket/issues/5689) (fixed): schemify: cross-module
+  inlining loses `set!` of the inlined function's argument
 - [racket/racket#5690](https://github.com/racket/racket/issues/5690): re-entering a continuation
   captured inside `fl+` mutates the flonum returned the first time
+- [racket/racket#5692](https://github.com/racket/racket/issues/5692): compiled `even?`/`odd?` on a
+  non-integer flonum reports `fleven?`/`flodd?` instead of `even?`/`odd?`
+- [racket/racket#5695](https://github.com/racket/racket/issues/5695): `=` raises "no exact
+  representation" for a fixnum above 2^53 and an inexact complex with an infinite or NaN part
 
 ## Quick start
 
-Requirements: Rust (`cargo`), a C toolchain, `make`, `rsync`, and network access once (the Racket
-build fetches its portable-bytecode boot files). Linux x86_64 is what it has been run on.
+Requirements: Rust (`cargo`), a C toolchain, `make`, `rsync`, `curl`, `python3` (the `ref93`
+findings' `repro.sh` uses it), and network access at build time: the Racket build fetches its
+portable-bytecode boot files, and `build.sh` downloads the Racket 9.3 minimal release for the `ref93`
+variant (or set `REF93_SRC` to an installed 9.3 tree, or `REF93_TGZ` to its tarball). Linux x86_64 is
+what it has been run on.
 
 ```
 git clone https://github.com/racket/racket
@@ -230,7 +238,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      They get about a quarter of the drawn cases. Cost: ~0.17-0.22 s per case vs 0.06 s default.
      A 25-program probe on the coverage build reached +12 000 C regions (gc.c, gc-par.inc,
      gc-oce.inc) over the cumulative profile.
-   - `ref93` (second reference, steering round 7): the same module, variant `none`, on a sixth
+   - `ref93` (second reference): the same module, variant `none`, on a sixth
      server (`f`, started on first use) running the released **Racket 9.3 CS** (minimal),
      which build.sh copies into `<build>/ref93` (from `$REF93_SRC` or the tarball `$REF93_TGZ` if set, else
      download.racket-lang.org) with the runner compiled by it in `<build>/harness93`. Compared
@@ -268,7 +276,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      `equal?` of hashes; never iteration order). Area tags `lib-num`, `lib-numstr`, `lib-cmp`,
      `lib-string`, `lib-char`, `lib-bytes`, `lib-symbol`, `lib-regexp`, `lib-print`, `lib-list`,
      `lib-hash`, `lib-typed`.
-   - `local`, `localpart`, `localzo` (metamorphic, steering round 8; runner.rkt `local-module`):
+   - `local`, `localpart`, `localzo` (metamorphic, runner.rkt `local-module`):
      the generated module-level items (all for `local`; for `localpart`/`localzo` a suffix
      starting at an index chosen from the program text, the rest stays at module level) are
      moved into an internal-definition body, either `(define (main%) <items> (void)) (main%)` or a
@@ -283,7 +291,7 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      (`letrec-syntaxes+values`, left to right) semantics give the same output. `localzo` =
      `localpart` + zo round trip. About a fifth of the drawn cases.
      `racket runner.rkt macrodump prog.rkt local` prints the rewrite.
-   - `preempt`, `preemptctl`, `preemptsplit` (metamorphic, steering round 9; runner.rkt
+   - `preempt`, `preemptctl`, `preemptsplit` (metamorphic, runner.rkt
      `preempt-module`, `start-preempt-helper!`): green-thread preemption must not change results.
      Racket threads are Chez engines (rumble engine.ss); when the engine timer runs out at an event
      check (procedure entry, loop back-edge) the timer interrupt captures the metacontinuation and
@@ -335,7 +343,7 @@ modes against the given build and exits 1/0/2.
 `server_restarts`, `segments`. `rktgen norm93 prog.rkt < result-lines` prints the ref93
 comparison form.
 
-Round 7 check (patched base build, 8 x 700 s + 4 x 500 s): ~28 000 cases, ~4 100 ref93
+Check of the ref93 oracle (a trunk build with fixes for the bugs found so far applied, 8 x 700 s + 4 x 500 s): ~28 000 cases, ~4 100 ref93
 comparisons, 0 failures; one earlier ref93 finding was a 9.3 bug repaired in trunk (8f67966b14),
 now skipped. On the unpatched trunk the old clusters (composable, splitmi set) still appear
 within minutes.
