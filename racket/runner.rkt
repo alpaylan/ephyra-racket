@@ -1212,6 +1212,7 @@
 ;; on every file port).
 ;; Use the first candidate where a file can actually be created.
 ;; (same cause: triage port__value__lib-print, TMPDIR unset in the search)
+;; (same cause: triage port__value__type-guard)
 (define pa:tmp-dir #f)
 (define (pa:find-tmp-dir)
   (or pa:tmp-dir
