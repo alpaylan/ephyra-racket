@@ -391,6 +391,19 @@ Val (eq?/eqv? on strings, chars and quoted literals is unspecified). New area ta
      and an output port written by 1-6 operations (bytes with ranges, strings, chars, bytes,
      `display`/`write`/`print`, `fprintf`, newline + flush, mid-way gets, positions, locations, big
      writes, position sets followed by a write). Area tags `port-in`, `port-out`.
+     First probe (4 x 420 s on a trunk build with fixes for the bugs found so far): the generator's port writes, run inside futures by
+     the future variants, crash the process: a future that writes > 4096 bytes to a bytes output
+     port (port buffer growth: `make-bytes` -> `guard-large-allocation` -> `current-thread` while
+     the port is locked, uninterruptible) prints `internal-error: attempting to suspend a future
+     in uninterruptible mode` plus a ` at <name>` backtrace (racket/src/cs/thread.sls
+     `internal-error`, thread/future.rkt) with Chez's printf on stdout, and then spins at ~200%
+     CPU instead of exiting (ignores SIGTERM). Also in 9.3. Standalone: a loop of
+     `(future (lambda () (write-bytes (make-bytes 5000 97) o)))` + `touch`, with the touch
+     delayed until a worker has started the future. Those stdout lines used to be read as the
+     next result line (findings `<variant>__error__*` with a message like ` at "make-bytes"`);
+     now any line that is not a result line makes the server count as dead (`died`, the lines are
+     in the message) and the server is killed; the variant repro retries a died future case up to
+     8 times with a 45 s limit and accepts an `internal-error:` line as reproduction.
    A variant-side timeout where the default finished is `hang`. `repro.sh` for these runs
    `runner.rkt file prog.rkt none` and `... <variant>` and compares.
 

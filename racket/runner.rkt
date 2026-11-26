@@ -1007,6 +1007,7 @@
      (define pa:kinds ',kinds)
      (define pa:okinds ',okinds)
      (define pa:seek? ,seek?)
+     (define pa:progress? ,(regexp-match? #rx"-evt\\)" src))
      ,@port-alt-forms
      ,(last pre)
      ,@(map walk items)))
@@ -1089,6 +1090,14 @@
   (unless (bytes? b) (open-input-bytes b name))
   (define k (pa:next pa:kinds))
   (define b* (bytes->immutable-bytes (bytes-copy b)))
+  (define p (pa:open-kind k b* name))
+  ;; racket/port's *-evt procedures: "The in must support progress events"
+  ;; (port-lib.scrbl); a custom port with a peek procedure but no progress
+  ;; events, or input-port-append, does not
+  (if (and pa:progress? (not (port-provides-progress-evts? p)))
+      (open-input-bytes b* name)
+      p))
+(define (pa:open-kind k b* name)
   (case k
     [(0) (open-input-bytes b* name)]
     [(1) (pa:custom-in b* #f k)]
